@@ -1,5 +1,5 @@
 -- =====================================================
--- AUTO AFK — RACKET RIVALS (v9 + TOGGLE + PERSIST)
+-- AUTO AFK — RACKET RIVALS (v11 — DRAG + TOGGLE FIXED)
 -- =====================================================
 local CONFIG = {
     PLACE_LOBBY  = 90906407195271,
@@ -9,19 +9,20 @@ local CONFIG = {
     DEBUG        = true,
     UI_ENABLED   = true,
     STATE_FILE   = "AutoAFK_racket_state.txt",
-    GRACE_DELAY  = 5,   -- detik sebelum teleport dari Lobby (bisa dibatalkan toggle)
+    GRACE_DELAY  = 5,
 }
 
 local Players         = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
 local UIS             = game:GetService("UserInputService")
+local TweenService    = game:GetService("TweenService")
 local VU              = game:GetService("VirtualUser")
 local player          = Players.LocalPlayer
 
 local function log(...) if CONFIG.DEBUG then print("[AutoAFK]", ...) end end
 
 -- =====================================================
--- State persistence (file, fallback ke getgenv)
+-- State persistence
 -- =====================================================
 local function loadEnabled()
     if getgenv().AutoAFK_Loaded then return getgenv().AutoAFK_Enabled end
@@ -32,11 +33,9 @@ local function loadEnabled()
             local ok2, content = pcall(readfile, CONFIG.STATE_FILE)
             if ok2 and content then
                 state = (content:lower():find("on") ~= nil)
-                log("State dari file:", state and "ON" or "OFF")
+                log("State file:", state and "ON" or "OFF")
             end
         end
-    else
-        log("File IO tidak tersedia — state hanya persist selama session")
     end
     getgenv().AutoAFK_Enabled = state
     getgenv().AutoAFK_Loaded = true
@@ -50,13 +49,12 @@ end
 
 getgenv().AutoAFK_Session = (getgenv().AutoAFK_Session or 0)
 
--- Anti-AFK
 player.Idled:Connect(function()
     pcall(function() VU:CaptureController(); VU:ClickButton2(Vector2.new()) end)
 end)
 
 -- =====================================================
--- Auto-reload
+-- Auto-reload + teleport
 -- =====================================================
 local function queueReload()
     if CONFIG.SCRIPT_URL == "" then return end
@@ -65,9 +63,6 @@ local function queueReload()
     pcall(function() if syn and syn.queue_on_teleport then syn.queue_on_teleport(code) end end)
 end
 
--- =====================================================
--- Teleport
--- =====================================================
 local function teleportTo(placeId, label, retries)
     retries = retries or 3
     log(string.format("Teleport ke %d (%s)...", placeId, label))
@@ -81,23 +76,56 @@ local function teleportTo(placeId, label, retries)
 end
 
 -- =====================================================
+-- UI Parent
+-- =====================================================
+local function getUIParent()
+    if gethui then
+        local ok, hui = pcall(gethui)
+        if ok and typeof(hui) == "Instance" then
+            log("UI parent: gethui()")
+            return hui
+        end
+    end
+    log("UI parent: PlayerGui")
+    return player:WaitForChild("PlayerGui")
+end
+
+local function destroyExistingUI()
+    local pg = player:FindFirstChild("PlayerGui")
+    if pg then
+        local old = pg:FindFirstChild("AutoAFK_UI")
+        if old then pcall(function() old:Destroy() end) end
+    end
+    if gethui then
+        pcall(function()
+            local hui = gethui()
+            if hui then
+                local old = hui:FindFirstChild("AutoAFK_UI")
+                if old then old:Destroy() end
+            end
+        end)
+    end
+end
+
+-- =====================================================
 -- UI
 -- =====================================================
 local currentUI = nil
 
-local function destroyUI()
-    if currentUI then pcall(function() currentUI.destroy() end); currentUI = nil end
-end
-
 local function buildUI(opts)
     opts = opts or {}
-    destroyUI()
-    local pg = player:WaitForChild("PlayerGui")
+    if currentUI then pcall(function() currentUI.destroy() end); currentUI = nil end
+    destroyExistingUI()
+
+    local parent = getUIParent()
 
     local sg = Instance.new("ScreenGui")
-    sg.Name = "AutoAFK_UI"; sg.ResetOnSpawn = false
-    sg.DisplayOrder = 100; sg.IgnoreGuiInset = true
-    sg.Parent = pg
+    sg.Name = "AutoAFK_UI"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 2147483647
+    sg.IgnoreGuiInset = true
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.Parent = parent
 
     local height = opts.showTimer and 172 or 52
     local panel = Instance.new("Frame")
@@ -108,25 +136,28 @@ local function buildUI(opts)
     panel.BackgroundTransparency = 0.08
     panel.BorderSizePixel = 0
     panel.Active = true
+    panel.ZIndex = 10
     panel.Parent = sg
     Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
     local stroke = Instance.new("UIStroke")
-    stroke.Thickness = 1.5; stroke.Transparency = 0.25
-    stroke.Parent = panel
+    stroke.Thickness = 1.5; stroke.Transparency = 0.25; stroke.Parent = panel
 
-    -- Header (clickable toggle)
-    local header = Instance.new("TextButton")
+    -- =====================================================
+    -- HEADER (drag handle ala ItemCatcher)
+    -- =====================================================
+    local header = Instance.new("Frame")
     header.Name = "Header"
     header.Size = UDim2.new(1, 0, 0, 52)
     header.BackgroundTransparency = 1
-    header.Text = ""
-    header.AutoButtonColor = false
+    header.Active = true
+    header.ZIndex = 11
     header.Parent = panel
 
     local dot = Instance.new("Frame")
     dot.Size = UDim2.new(0, 10, 0, 10)
     dot.Position = UDim2.new(0, 16, 0.5, -5)
     dot.BorderSizePixel = 0
+    dot.ZIndex = 12
     dot.Parent = header
     Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
 
@@ -139,44 +170,58 @@ local function buildUI(opts)
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Font = Enum.Font.GothamBold
     title.TextSize = 14
+    title.ZIndex = 12
     title.Parent = header
 
-    local statusText = Instance.new("TextLabel")
-    statusText.Size = UDim2.new(0, 60, 1, 0)
-    statusText.Position = UDim2.new(1, -140, 0, 0)
-    statusText.BackgroundTransparency = 1
-    statusText.Text = ""
-    statusText.TextXAlignment = Enum.TextXAlignment.Right
-    statusText.Font = Enum.Font.GothamSemibold
-    statusText.TextSize = 12
-    statusText.Parent = header
-
-    local switch = Instance.new("Frame")
-    switch.Size = UDim2.new(0, 48, 0, 24)
-    switch.Position = UDim2.new(1, -76, 0.5, -12)
-    switch.BorderSizePixel = 0
-    switch.Parent = header
-    Instance.new("UICorner", switch).CornerRadius = UDim.new(1, 0)
+    -- =====================================================
+    -- TOGGLE SWITCH (elemen terpisah, bukan header)
+    -- =====================================================
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Name = "Toggle"
+    toggleBtn.Size = UDim2.new(0, 76, 0, 28)
+    toggleBtn.Position = UDim2.new(1, -86, 0.5, -14)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 90)
+    toggleBtn.Text = ""
+    toggleBtn.AutoButtonColor = false
+    toggleBtn.Active = true
+    toggleBtn.ZIndex = 13
+    toggleBtn.Parent = header
+    Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(1, 0)
 
     local knob = Instance.new("Frame")
-    knob.Size = UDim2.new(0, 20, 0, 20)
+    knob.Name = "Knob"
+    knob.Size = UDim2.new(0, 22, 0, 22)
+    knob.Position = UDim2.new(0, 3, 0.5, -11)
     knob.BorderSizePixel = 0
     knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    knob.Parent = switch
+    knob.ZIndex = 14
+    knob.Parent = toggleBtn
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local knobText = Instance.new("TextLabel")
+    knobText.Size = UDim2.new(1, 0, 1, 0)
+    knobText.BackgroundTransparency = 1
+    knobText.Text = "OFF"
+    knobText.TextColor3 = Color3.fromRGB(40, 40, 50)
+    knobText.Font = Enum.Font.GothamBold
+    knobText.TextSize = 9
+    knobText.ZIndex = 15
+    knobText.Parent = toggleBtn
 
     local function applyVisuals(state)
         local onC, offC = Color3.fromRGB(80, 220, 120), Color3.fromRGB(220, 80, 80)
         dot.BackgroundColor3 = state and onC or offC
-        switch.BackgroundColor3 = state and onC or Color3.fromRGB(80, 80, 90)
-        knob.Position = state and UDim2.new(1, -22, 0.5, -10) or UDim2.new(0, 2, 0.5, -10)
+        toggleBtn.BackgroundColor3 = state and onC or Color3.fromRGB(80, 80, 90)
+        knob.Position = state and UDim2.new(1, -25, 0.5, -11) or UDim2.new(0, 3, 0.5, -11)
+        knobText.Text = state and "ON" or "OFF"
+        knobText.TextColor3 = state and onC or offC
         stroke.Color = state and onC or offC
-        statusText.Text = state and "ON" or "OFF"
-        statusText.TextColor3 = state and onC or offC
     end
     applyVisuals(getgenv().AutoAFK_Enabled)
 
+    -- =====================================================
     -- Timer section (AFK only)
+    -- =====================================================
     local timerLabel, barFill, subLabel
     local timerStart = opts.startTime or tick()
     local timerDuration = opts.duration or 0
@@ -191,6 +236,7 @@ local function buildUI(opts)
         timerLabel.TextXAlignment = Enum.TextXAlignment.Left
         timerLabel.Font = Enum.Font.GothamBlack
         timerLabel.TextSize = 36
+        timerLabel.ZIndex = 11
         timerLabel.Parent = panel
 
         local barBg = Instance.new("Frame")
@@ -198,6 +244,7 @@ local function buildUI(opts)
         barBg.Position = UDim2.new(0, 14, 0, 102)
         barBg.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
         barBg.BorderSizePixel = 0
+        barBg.ZIndex = 11
         barBg.Parent = panel
         Instance.new("UICorner", barBg).CornerRadius = UDim.new(1, 0)
 
@@ -205,6 +252,7 @@ local function buildUI(opts)
         barFill.Size = UDim2.new(0, 0, 1, 0)
         barFill.BackgroundColor3 = Color3.fromRGB(255, 200, 60)
         barFill.BorderSizePixel = 0
+        barFill.ZIndex = 12
         barFill.Parent = barBg
         Instance.new("UICorner", barFill).CornerRadius = UDim.new(1, 0)
 
@@ -217,6 +265,7 @@ local function buildUI(opts)
         subLabel.TextXAlignment = Enum.TextXAlignment.Left
         subLabel.Font = Enum.Font.Gotham
         subLabel.TextSize = 12
+        subLabel.ZIndex = 11
         subLabel.Parent = panel
 
         local info = Instance.new("TextLabel")
@@ -228,6 +277,7 @@ local function buildUI(opts)
         info.TextXAlignment = Enum.TextXAlignment.Left
         info.Font = Enum.Font.Gotham
         info.TextSize = 11
+        info.ZIndex = 11
         info.Parent = panel
 
         local session = Instance.new("TextLabel")
@@ -239,6 +289,7 @@ local function buildUI(opts)
         session.TextXAlignment = Enum.TextXAlignment.Left
         session.Font = Enum.Font.Gotham
         session.TextSize = 10
+        session.ZIndex = 11
         session.Parent = panel
     end
 
@@ -256,27 +307,43 @@ local function buildUI(opts)
     end
     if opts.showTimer then update() end
 
-    -- Drag
-    local dragging, dragStart, startPos
-    panel.InputBegan:Connect(function(input)
+    -- =====================================================
+    -- DRAG — pola exact dari ItemCatcher
+    -- =====================================================
+    local dragging, dragInput, dragStart, startPos
+    header.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true; dragStart = input.Position; startPos = panel.Position
+            dragging = true
+            dragStart = input.Position
+            startPos = panel.Position
             input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
             end)
+            log("drag start")
+        end
+    end)
+    header.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
         end
     end)
     UIS.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-                      or input.UserInputType == Enum.UserInputType.Touch) then
+        if dragging and input == dragInput then
             local d = input.Position - dragStart
-            panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
-                                       startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            panel.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y
+            )
         end
     end)
 
-    -- Toggle handler
+    -- =====================================================
+    -- TOGGLE HANDLER (di tombol terpisah, tidak konflik dengan drag)
+    -- =====================================================
     local toggling = false
     local function onToggle()
         if toggling then return end
@@ -288,9 +355,9 @@ local function buildUI(opts)
 
         if not newState then
             if game.PlaceId == CONFIG.PLACE_AFK then
-                log("OFF di AFK → balik ke Lobby")
+                log("OFF di AFK → balik ke Lobby dalam 0.5s")
                 task.spawn(function()
-                    task.wait(0.3)
+                    task.wait(0.5)
                     teleportTo(CONFIG.PLACE_LOBBY, "balik (toggle OFF)")
                 end)
             end
@@ -301,22 +368,32 @@ local function buildUI(opts)
                     local t0 = tick()
                     while (tick() - t0) < CONFIG.GRACE_DELAY do
                         task.wait(0.2)
-                        if not getgenv().AutoAFK_Enabled then
-                            log("Dibatalkan"); return
-                        end
+                        if not getgenv().AutoAFK_Enabled then log("dibatalkan"); return end
                     end
                     teleportTo(CONFIG.PLACE_AFK, "masuk AFK")
                 end)
             end
         end
-        task.wait(0.3); toggling = false
+        task.wait(0.3)
+        toggling = false
     end
 
-    header.MouseButton1Click:Connect(onToggle)
-    header.Activated:Connect(onToggle)
+    toggleBtn.MouseButton1Click:Connect(onToggle)
+
+    -- Hover feedback
+    toggleBtn.MouseEnter:Connect(function()
+        TweenService:Create(toggleBtn, TweenInfo.new(0.12), {
+            BackgroundTransparency = 0.15
+        }):Play()
+    end)
+    toggleBtn.MouseLeave:Connect(function()
+        TweenService:Create(toggleBtn, TweenInfo.new(0.12), {
+            BackgroundTransparency = 0
+        }):Play()
+    end)
 
     currentUI = {
-        destroy = function() sg:Destroy() end,
+        destroy = function() pcall(function() sg:Destroy() end) end,
         update = update,
     }
     return currentUI
@@ -325,26 +402,27 @@ end
 -- =====================================================
 -- MAIN
 -- =====================================================
-log("=== AUTO AFK START | PlaceId:", game.PlaceId, "===")
+log("=== AUTO AFK v11 START | PlaceId:", game.PlaceId, "===")
 loadEnabled()
 log("State:", getgenv().AutoAFK_Enabled and "ON" or "OFF")
 queueReload()
 
--- Bangun UI sesuai posisi
-if game.PlaceId == CONFIG.PLACE_LOBBY then
-    buildUI({ showTimer = false })
-elseif game.PlaceId == CONFIG.PLACE_AFK then
-    getgenv().AutoAFK_StartTime = tick()
-    buildUI({
-        showTimer = true,
-        duration = CONFIG.AFK_DURATION,
-        startTime = getgenv().AutoAFK_StartTime,
-        destinationLabel = "Lobby",
-    })
+if CONFIG.UI_ENABLED then
+    if game.PlaceId == CONFIG.PLACE_LOBBY then
+        buildUI({ showTimer = false })
+    elseif game.PlaceId == CONFIG.PLACE_AFK then
+        getgenv().AutoAFK_StartTime = tick()
+        buildUI({
+            showTimer = true,
+            duration = CONFIG.AFK_DURATION,
+            startTime = getgenv().AutoAFK_StartTime,
+            destinationLabel = "Lobby",
+        })
+    end
 end
 
 if not getgenv().AutoAFK_Enabled then
-    log("State OFF — script idle. Toggle ON lewat UI kalau mau mulai.")
+    log("State OFF — idle. Klik toggle untuk ON.")
     return
 end
 
@@ -368,7 +446,7 @@ elseif game.PlaceId == CONFIG.PLACE_AFK then
     while (tick() - t0) < CONFIG.AFK_DURATION do
         task.wait(0.5)
         if not getgenv().AutoAFK_Enabled then
-            log("Toggled OFF → toggle handler teleport balik")
+            log("Toggled OFF — teleport handler akan jalan")
             return
         end
         if currentUI and currentUI.update then pcall(currentUI.update) end
