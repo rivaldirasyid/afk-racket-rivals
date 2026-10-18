@@ -1,6 +1,6 @@
 -- =====================================================
--- AUTO AFK — RACKET RIVALS (v17 — UI DETECTION)
--- Membaca status UI secara langsung. 100% akurat.
+-- AUTO AFK — RACKET RIVALS (v18 — SAFE BUFFER)
+-- Deteksi UI + Jeda Aman 2 Menit sebelum Lobby
 -- =====================================================
 local CONFIG = {
     PLACE_LOBBY  = 90906407195271,
@@ -9,8 +9,12 @@ local CONFIG = {
     -- Path UI yang ditemukan
     UI_PATH = "PAGES.AfkLobbyPage.Content.Body.Earnings.TimerCard.GuaranteeStrip.Body.Note",
     
-    -- Fallback timer (jika UI gagal dibaca karena bug game)
-    FALLBACK_DURATION = 31 * 60, -- 31 menit (buffer 1 menit)
+    -- Jeda aman setelah teks "collected" muncul (dalam detik)
+    SAFE_BUFFER = 2 * 60, 
+    
+    -- Fallback timer absolut (jika UI gagal dibaca sama sekali)
+    -- 30 menit (target) + 2 menit (buffer) + 2 menit (safety) = 34 menit
+    FALLBACK_DURATION = 34 * 60, 
     
     SCRIPT_URL   = "https://raw.githubusercontent.com/rivaldirasyid/afk-racket-rivals/refs/heads/main/init",
     DEBUG        = true,
@@ -24,8 +28,7 @@ local CONFIG = {
     -- Timing
     GRACE_DELAY     = 5,
     HEARTBEAT_EVERY = 10,
-    WATCHDOG_EVERY  = 3,
-    POLL_RATE       = 1,  -- cek UI tiap 1 detik
+    POLL_RATE       = 1,
 
     -- Anti-idle
     ANTI_IDLE_INTERVAL = 55,
@@ -119,25 +122,22 @@ local function teleportTo(placeId, label)
     log(string.format("Teleport ke %d (%s)...", placeId, label))
     local ok = pcall(function() TeleportService:Teleport(placeId, player) end)
     if ok then return true end
-    -- Fallback
     return pcall(function() TeleportService:TeleportAsync(placeId, {player}) end)
 end
 
 -- =====================================================
--- DETEKTOR REWARD 400 YEN
+-- DETEKTOR UI GAME
 -- =====================================================
 local function isRewardCollected()
     local pg = player:FindFirstChild("PlayerGui")
     if not pg then return false, "No PlayerGui" end
     
-    -- Telusuri path sesuai temuan
     local current = pg
     for segment in CONFIG.UI_PATH:gmatch("[^%.]+") do
         current = current:FindFirstChild(segment)
         if not current then return false, "Path not found" end
     end
     
-    -- Cek teks
     local txt = current.Text:lower()
     if txt:find("collected") then
         return true, current.Text
@@ -146,7 +146,7 @@ local function isRewardCollected()
 end
 
 -- =====================================================
--- UI Builder
+-- UI Builder (Dengan Logika Buffer)
 -- =====================================================
 local currentUI = nil
 
@@ -188,14 +188,14 @@ local function buildUI(opts)
     title.Size = UDim2.new(1, -100, 1, 0)
     title.Position = UDim2.new(0, 34, 0, 0)
     title.BackgroundTransparency = 1
-    title.Text = "AUTO AFK (v17)"
+    title.Text = "AUTO AFK (v18)"
     title.TextColor3 = Color3.fromRGB(240, 240, 250)
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Font = Enum.Font.GothamBold
     title.TextSize = 13
 
-    -- Timer Info
-    local infoLabel
+    -- Info Timer
+    local infoLabel, subLabel
     if opts.showTimer then
         infoLabel = Instance.new("TextLabel", panel)
         infoLabel.Size = UDim2.new(1, -28, 0, 20)
@@ -207,7 +207,7 @@ local function buildUI(opts)
         infoLabel.Font = Enum.Font.GothamBold
         infoLabel.TextSize = 14
         
-        local subLabel = Instance.new("TextLabel", panel)
+        subLabel = Instance.new("TextLabel", panel)
         subLabel.Size = UDim2.new(1, -28, 0, 16)
         subLabel.Position = UDim2.new(0, 14, 0, 78)
         subLabel.BackgroundTransparency = 1
@@ -233,13 +233,24 @@ local function buildUI(opts)
         end
     end)
 
-    local function updateStatus(text, subtext, isReady)
+    -- Fungsi update UI
+    local function updateStatus(mainText, subText, isReady, isBuffer)
         if infoLabel then
-            infoLabel.Text = text
-            infoLabel.TextColor3 = isReady and Color3.fromRGB(80, 220, 120) or Color3.fromRGB(255, 220, 80)
-            if subLabel then subLabel.Text = subtext end
-            stroke.Color = isReady and Color3.fromRGB(80, 220, 120) or Color3.fromRGB(255, 200, 60)
-            dot.BackgroundColor3 = isReady and Color3.fromRGB(80, 220, 120) or Color3.fromRGB(255, 200, 60)
+            infoLabel.Text = mainText
+            if isBuffer then
+                infoLabel.TextColor3 = Color3.fromRGB(255, 140, 60) -- Oranye untuk mode buffer
+                stroke.Color = Color3.fromRGB(255, 140, 60)
+                dot.BackgroundColor3 = Color3.fromRGB(255, 140, 60)
+            elseif isReady then
+                infoLabel.TextColor3 = Color3.fromRGB(80, 220, 120)
+                stroke.Color = Color3.fromRGB(80, 220, 120)
+                dot.BackgroundColor3 = Color3.fromRGB(80, 220, 120)
+            else
+                infoLabel.TextColor3 = Color3.fromRGB(255, 220, 80)
+                stroke.Color = Color3.fromRGB(255, 200, 60)
+                dot.BackgroundColor3 = Color3.fromRGB(255, 200, 60)
+            end
+            if subLabel then subLabel.Text = subText end
         end
     end
 
@@ -257,7 +268,6 @@ queueReload()
 
 if game.PlaceId == CONFIG.PLACE_LOBBY then
     log("=== LOBBY ===")
-    -- Cek apakah baru balik dari AFK
     local sessMode = loadSession()
     if sessMode == "afk" then clearSession() end
     
@@ -275,13 +285,12 @@ if game.PlaceId == CONFIG.PLACE_LOBBY then
 elseif game.PlaceId == CONFIG.PLACE_AFK then
     log("=== AFK ROOM ===")
     
-    -- Load session (bertahan dari auto-rejoin)
+    -- Load Session
     local sessMode, sessStart = loadSession()
     if sessMode == "lobby" then
         saveSession("afk", os.time())
         sessStart = os.time()
     elseif not sessStart then
-        -- Fallback jika file hilang total (anggap sesi baru)
         sessStart = os.time()
         saveSession("afk", sessStart)
     end
@@ -289,47 +298,80 @@ elseif game.PlaceId == CONFIG.PLACE_AFK then
     if CONFIG.UI_ENABLED then buildUI({showTimer = true}) end
     if not enabled then return end
 
-    log("Mulai pemantauan UI Reward 400 Yen...")
-    local detected = false
+    log("Fase 1: Menunggu UI Game berubah 'collected'...")
+    local detectedCollected = false
+    local detectionTime = 0
     
-    -- Loop pantau UI
+    -- =====================================================
+    -- FASE 1: Menunggu UI "collected"
+    -- =====================================================
     while enabled do
         task.wait(CONFIG.POLL_RATE)
         
-        -- 1. Cek UI Game
         local isCollected, currentText = isRewardCollected()
         
         if isCollected then
-            log("✅ REWARD 400 YEN DITEMUKAN! Teks UI: " .. currentText)
-            detected = true
-            if currentUI then currentUI.updateStatus("✅ REWARD DIDAPAT", "Pindah ke Lobby...", true) end
-            task.wait(2) -- Jeda bentar biar user lihat UI
+            log("✅ Teks UI berubah: " .. currentText)
+            detectedCollected = true
+            detectionTime = os.time()
             break
         end
         
-        -- 2. Cek Fallback Timer (jika UI bug / tidak ketemu)
         local elapsed = os.time() - sessStart
         if elapsed >= CONFIG.FALLBACK_DURATION then
-            log("⚠️ Fallback timer tercapai (31 menit). Force exit.")
-            detected = true
+            log("⚠️ Fallback timer tercapai (UI macet). Force exit.")
+            detectedCollected = true
+            detectionTime = os.time() - CONFIG.SAFE_BUFFER -- Paksa buffer langsung habis
             break
         end
         
-        -- Update UI Script tiap detik
         if currentUI and (elapsed % 5 == 0) then
             local sisa = math.max(0, 1800 - elapsed)
             currentUI.updateStatus(
                 string.format("Sisa %02d:%02d", math.floor(sisa/60), sisa%60), 
-                "Status UI: " .. (currentText or "?")
+                "Status UI: " .. (currentText or "?"), false, false
             )
         end
     end
     
-    -- EXIT SEQUENCE
-    clearSession()
-    log("Keluar ke Lobby untuk reset sesi...")
-    queueReload()
-    teleportTo(CONFIG.PLACE_LOBBY, "balik ke Lobby")
+    -- =====================================================
+    -- FASE 2: Safe Buffer (Jeda 2 Menit)
+    -- =====================================================
+    if detectedCollected and enabled then
+        log(string.format("Fase 2: Memulai Safe Buffer (%d detik)...", CONFIG.SAFE_BUFFER))
+        
+        while enabled do
+            task.wait(CONFIG.POLL_RATE)
+            
+            local bufferElapsed = os.time() - detectionTime
+            local bufferRemaining = CONFIG.SAFE_BUFFER - bufferElapsed
+            
+            if bufferRemaining <= 0 then
+                log("✅ Buffer selesai. Waktunya balik ke Lobby!")
+                break
+            end
+            
+            -- Update UI saat buffer berjalan
+            if currentUI then
+                currentUI.updateStatus(
+                    string.format("Buffer: %02d:%02d", math.floor(bufferRemaining/60), bufferRemaining%60),
+                    "Reward aman. Menunggu jeda...", 
+                    false, true -- Parameter isBuffer = true
+                )
+            end
+        end
+    end
+    
+    -- =====================================================
+    -- FASE 3: Keluar ke Lobby
+    -- =====================================================
+    if enabled then
+        if currentUI then currentUI.updateStatus("✅ KELUAR", "Pindah ke Lobby...", true, false) end
+        task.wait(1) -- Jeda bentar biar UI script terlihat
+        clearSession()
+        queueReload()
+        teleportTo(CONFIG.PLACE_LOBBY, "balik ke Lobby")
+    end
     
 else
     log("PlaceId tidak dikenal.")
