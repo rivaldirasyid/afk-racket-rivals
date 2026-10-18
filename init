@@ -1,0 +1,83 @@
+-- =====================================================
+-- AUTO AFK — RACKET RIVALS (CLEAN)
+-- Pure TeleportService, no prompts, no clicks
+-- =====================================================
+local CONFIG = {
+    PLACE_LOBBY  = 90906407195271,
+    PLACE_AFK    = 82492382424045,
+    AFK_DURATION = 32 * 60,       -- 32 menit
+    SCRIPT_URL   = "",            -- isi URL raw untuk full-auto loop
+    DEBUG        = true,
+}
+
+local Players         = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local VU              = game:GetService("VirtualUser")
+local player          = Players.LocalPlayer
+
+local function log(...) if CONFIG.DEBUG then print("[AutoAFK]", ...) end end
+
+-- Anti-AFK
+player.Idled:Connect(function()
+    pcall(function()
+        VU:CaptureController()
+        VU:ClickButton2(Vector2.new())
+    end)
+end)
+
+-- Auto-reload setelah teleport
+local function queueReload()
+    if CONFIG.SCRIPT_URL == "" then
+        log("SCRIPT_URL kosong — auto-reload off (mode manual)")
+        return
+    end
+    local code = string.format('task.wait(3) loadstring(game:HttpGet("%s"))()', CONFIG.SCRIPT_URL)
+    pcall(function() if queue_on_teleport then queue_on_teleport(code) end end)
+    pcall(function() if syn and syn.queue_on_teleport then syn.queue_on_teleport(code) end end)
+end
+
+-- Teleport dengan retry
+local function teleportTo(placeId, label, retries)
+    retries = retries or 3
+    log(string.format("Teleport ke %d (%s)...", placeId, label))
+    for i = 1, retries do
+        local ok, err = pcall(function()
+            TeleportService:Teleport(placeId, player)
+        end)
+        log(string.format("  Attempt %d → %s (%s)", i, tostring(ok), tostring(err)))
+        if ok then return true end
+        task.wait(3)
+    end
+    return false
+end
+
+-- =====================================================
+-- MAIN
+-- =====================================================
+log("=== AUTO AFK START | PlaceId:", game.PlaceId, "===")
+
+if game.PlaceId == CONFIG.PLACE_LOBBY then
+    log("Mode: LOBBY → AFK")
+    queueReload()
+    if not teleportTo(CONFIG.PLACE_AFK, "masuk AFK") then
+        log("Gagal teleport ke AFK.")
+    end
+
+elseif game.PlaceId == CONFIG.PLACE_AFK then
+    log(string.format("Mode: AFK ROOM — tunggu %d menit...", CONFIG.AFK_DURATION / 60))
+    queueReload()
+
+    local t0 = tick()
+    while (tick() - t0) < CONFIG.AFK_DURATION do
+        task.wait(10)
+    end
+
+    log("Waktu habis → balik ke Lobby")
+    if not teleportTo(CONFIG.PLACE_LOBBY, "balik ke Lobby") then
+        log("Gagal teleport balik ke Lobby.")
+    end
+
+else
+    log("PlaceId tidak dikenal:", game.PlaceId)
+    log("Script hanya untuk:", CONFIG.PLACE_LOBBY, "(Lobby) &", CONFIG.PLACE_AFK, "(AFK)")
+end
