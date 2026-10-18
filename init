@@ -1,34 +1,35 @@
 -- =====================================================
--- AUTO AFK — RACKET RIVALS (CLEAN)
--- Pure TeleportService, no prompts, no clicks
+-- AUTO AFK — RACKET RIVALS (v8 + TIMER UI)
 -- =====================================================
 local CONFIG = {
     PLACE_LOBBY  = 90906407195271,
     PLACE_AFK    = 82492382424045,
-    AFK_DURATION = 50,       -- 32 menit
-    SCRIPT_URL   = "https://raw.githubusercontent.com/rivaldirasyid/afk-racket-rivals/refs/heads/main/init",            -- isi URL raw untuk full-auto loop
+    AFK_DURATION = 32 * 60,
+    SCRIPT_URL   = "https://raw.githubusercontent.com/rivaldirasyid/afk-racket-rivals/refs/heads/main/init",
     DEBUG        = true,
+    UI_ENABLED   = true,   -- set false kalau tidak mau UI
 }
 
 local Players         = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
+local UIS             = game:GetService("UserInputService")
 local VU              = game:GetService("VirtualUser")
 local player          = Players.LocalPlayer
 
 local function log(...) if CONFIG.DEBUG then print("[AutoAFK]", ...) end end
 
+-- Session counter (persist antar teleport via getgenv)
+getgenv().AutoAFK_Session = (getgenv().AutoAFK_Session or 0)
+
 -- Anti-AFK
 player.Idled:Connect(function()
-    pcall(function()
-        VU:CaptureController()
-        VU:ClickButton2(Vector2.new())
-    end)
+    pcall(function() VU:CaptureController(); VU:ClickButton2(Vector2.new()) end)
 end)
 
--- Auto-reload setelah teleport
+-- Auto-reload
 local function queueReload()
     if CONFIG.SCRIPT_URL == "" then
-        log("SCRIPT_URL kosong — auto-reload off (mode manual)")
+        log("SCRIPT_URL kosong — auto-reload off")
         return
     end
     local code = string.format('task.wait(3) loadstring(game:HttpGet("%s"))()', CONFIG.SCRIPT_URL)
@@ -52,6 +53,206 @@ local function teleportTo(placeId, label, retries)
 end
 
 -- =====================================================
+-- UI Countdown Timer (untuk AFK Room)
+-- =====================================================
+local function createTimerUI(duration, destinationLabel)
+    local pg = player:WaitForChild("PlayerGui")
+
+    -- Hapus UI lama kalau ada
+    local old = pg:FindFirstChild("AutoAFK_TimerUI")
+    if old then old:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "AutoAFK_TimerUI"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 100
+    sg.IgnoreGuiInset = true
+    sg.Parent = pg
+
+    -- Frame utama
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Size = UDim2.new(0, 300, 0, 158)
+    main.Position = UDim2.new(1, -320, 0, 20)
+    main.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+    main.BackgroundTransparency = 0.08
+    main.BorderSizePixel = 0
+    main.Active = true
+    main.Parent = sg
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 12)
+    corner.Parent = main
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 200, 60)
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.25
+    stroke.Parent = main
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0, 10)
+    pad.PaddingBottom = UDim.new(0, 10)
+    pad.PaddingLeft = UDim.new(0, 14)
+    pad.PaddingRight = UDim.new(0, 14)
+    pad.Parent = main
+
+    -- Title row: dot + status
+    local titleRow = Instance.new("Frame")
+    titleRow.Size = UDim2.new(1, 0, 0, 18)
+    titleRow.BackgroundTransparency = 1
+    titleRow.Parent = main
+
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.new(0, 10, 0, 10)
+    dot.Position = UDim2.new(0, 0, 0.5, -5)
+    dot.BackgroundColor3 = Color3.fromRGB(80, 220, 120)
+    dot.BorderSizePixel = 0
+    dot.Parent = titleRow
+    local dc = Instance.new("UICorner"); dc.CornerRadius = UDim.new(1, 0); dc.Parent = dot
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -20, 1, 0)
+    title.Position = UDim2.new(0, 18, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "AUTO AFK — ACTIVE"
+    title.TextColor3 = Color3.fromRGB(240, 240, 250)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 13
+    title.Parent = titleRow
+
+    -- Big timer
+    local timer = Instance.new("TextLabel")
+    timer.Name = "Timer"
+    timer.Size = UDim2.new(1, 0, 0, 46)
+    timer.Position = UDim2.new(0, 0, 0, 22)
+    timer.BackgroundTransparency = 1
+    timer.Text = "00:00"
+    timer.TextColor3 = Color3.fromRGB(255, 220, 80)
+    timer.TextXAlignment = Enum.TextXAlignment.Left
+    timer.Font = Enum.Font.GothamBlack
+    timer.TextSize = 38
+    timer.Parent = main
+
+    -- Progress bar
+    local barBg = Instance.new("Frame")
+    barBg.Size = UDim2.new(1, 0, 0, 8)
+    barBg.Position = UDim2.new(0, 0, 0, 74)
+    barBg.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    barBg.BorderSizePixel = 0
+    barBg.Parent = main
+    local bgc = Instance.new("UICorner"); bgc.CornerRadius = UDim.new(1, 0); bgc.Parent = barBg
+
+    local barFill = Instance.new("Frame")
+    barFill.Name = "Fill"
+    barFill.Size = UDim2.new(0, 0, 1, 0)
+    barFill.BackgroundColor3 = Color3.fromRGB(255, 200, 60)
+    barFill.BorderSizePixel = 0
+    barFill.Parent = barBg
+    local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(1, 0); fc.Parent = barFill
+
+    -- Sub info (return time + progress %)
+    local sub = Instance.new("TextLabel")
+    sub.Name = "Sub"
+    sub.Size = UDim2.new(1, 0, 0, 18)
+    sub.Position = UDim2.new(0, 0, 0, 88)
+    sub.BackgroundTransparency = 1
+    sub.Text = "Return at --:--:--"
+    sub.TextColor3 = Color3.fromRGB(180, 180, 200)
+    sub.TextXAlignment = Enum.TextXAlignment.Left
+    sub.Font = Enum.Font.Gotham
+    sub.TextSize = 12
+    sub.Parent = main
+
+    -- Info row (PlaceId + next destination)
+    local info = Instance.new("TextLabel")
+    info.Name = "Info"
+    info.Size = UDim2.new(1, 0, 0, 16)
+    info.Position = UDim2.new(0, 0, 0, 106)
+    info.BackgroundTransparency = 1
+    info.Text = string.format("PlaceId: %d → %s", game.PlaceId, destinationLabel or "Lobby")
+    info.TextColor3 = Color3.fromRGB(150, 150, 170)
+    info.TextXAlignment = Enum.TextXAlignment.Left
+    info.Font = Enum.Font.Gotham
+    info.TextSize = 11
+    info.Parent = main
+
+    -- Session row
+    local session = Instance.new("TextLabel")
+    session.Name = "Session"
+    session.Size = UDim2.new(1, 0, 0, 14)
+    session.Position = UDim2.new(0, 0, 0, 124)
+    session.BackgroundTransparency = 1
+    session.Text = string.format("Session #%d", getgenv().AutoAFK_Session)
+    session.TextColor3 = Color3.fromRGB(130, 130, 150)
+    session.TextXAlignment = Enum.TextXAlignment.Left
+    session.Font = Enum.Font.Gotham
+    session.TextSize = 10
+    session.Parent = main
+
+    -- Drag support
+    local dragging, dragStart, startPos
+    main.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+            local endConn
+            endConn = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    if endConn then endConn:Disconnect() end
+                end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                      or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    -- Helpers
+    local startTime = tick()
+
+    local function fmtMMSS(sec)
+        sec = math.max(0, math.floor(sec))
+        local m = math.floor(sec / 60)
+        local s = sec % 60
+        return string.format("%02d:%02d", m, s)
+    end
+
+    local function fmtClock(ts)
+        return os.date("%H:%M:%S", ts)
+    end
+
+    -- Update function
+    local function update()
+        local elapsed = tick() - startTime
+        local remaining = duration - elapsed
+        timer.Text = fmtMMSS(remaining)
+        local pct = math.clamp(elapsed / duration, 0, 1)
+        barFill.Size = UDim2.new(pct, 0, 1, 0)
+        local returnAt = os.time() + math.max(0, math.floor(remaining))
+        sub.Text = string.format("Return at %s  •  %d%%", fmtClock(returnAt), math.floor(pct * 100))
+    end
+
+    update()
+
+    return {
+        update = update,
+        destroy = function() sg:Destroy() end,
+    }
+end
+
+-- =====================================================
 -- MAIN
 -- =====================================================
 log("=== AUTO AFK START | PlaceId:", game.PlaceId, "===")
@@ -59,6 +260,8 @@ log("=== AUTO AFK START | PlaceId:", game.PlaceId, "===")
 if game.PlaceId == CONFIG.PLACE_LOBBY then
     log("Mode: LOBBY → AFK")
     queueReload()
+    getgenv().AutoAFK_Session = getgenv().AutoAFK_Session + 1
+    log("Session #" .. getgenv().AutoAFK_Session)
     if not teleportTo(CONFIG.PLACE_AFK, "masuk AFK") then
         log("Gagal teleport ke AFK.")
     end
@@ -67,17 +270,31 @@ elseif game.PlaceId == CONFIG.PLACE_AFK then
     log(string.format("Mode: AFK ROOM — tunggu %d menit...", CONFIG.AFK_DURATION / 60))
     queueReload()
 
-    local t0 = tick()
-    while (tick() - t0) < CONFIG.AFK_DURATION do
-        task.wait(10)
+    -- Buat UI
+    local ui = nil
+    if CONFIG.UI_ENABLED then
+        local ok, err = pcall(function()
+            ui = createTimerUI(CONFIG.AFK_DURATION, "Lobby")
+        end)
+        if not ok then log("UI gagal dibuat:", err) end
     end
 
+    -- Loop tunggu dengan update UI
+    local t0 = tick()
+    while (tick() - t0) < CONFIG.AFK_DURATION do
+        task.wait(0.5)
+        if ui then
+            pcall(ui.update)
+        end
+    end
+
+    if ui then ui.destroy() end
     log("Waktu habis → balik ke Lobby")
+
     if not teleportTo(CONFIG.PLACE_LOBBY, "balik ke Lobby") then
         log("Gagal teleport balik ke Lobby.")
     end
 
 else
     log("PlaceId tidak dikenal:", game.PlaceId)
-    log("Script hanya untuk:", CONFIG.PLACE_LOBBY, "(Lobby) &", CONFIG.PLACE_AFK, "(AFK)")
 end
