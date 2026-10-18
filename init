@@ -1,5 +1,5 @@
 -- =====================================================
--- AUTO AFK — RACKET RIVALS (v11 — DRAG + TOGGLE FIXED)
+-- AUTO AFK — RACKET RIVALS (v13 — FORCE gethui)
 -- =====================================================
 local CONFIG = {
     PLACE_LOBBY  = 90906407195271,
@@ -10,6 +10,8 @@ local CONFIG = {
     UI_ENABLED   = true,
     STATE_FILE   = "AutoAFK_racket_state.txt",
     GRACE_DELAY  = 5,
+    WATCHDOG     = 1.5,    -- detik antar cek parent
+    KEYBIND      = Enum.KeyCode.RightShift,
 }
 
 local Players         = game:GetService("Players")
@@ -76,20 +78,8 @@ local function teleportTo(placeId, label, retries)
 end
 
 -- =====================================================
--- UI Parent
+-- Destroy existing
 -- =====================================================
-local function getUIParent()
-    if gethui then
-        local ok, hui = pcall(gethui)
-        if ok and typeof(hui) == "Instance" then
-            log("UI parent: gethui()")
-            return hui
-        end
-    end
-    log("UI parent: PlayerGui")
-    return player:WaitForChild("PlayerGui")
-end
-
 local function destroyExistingUI()
     local pg = player:FindFirstChild("PlayerGui")
     if pg then
@@ -108,6 +98,32 @@ local function destroyExistingUI()
 end
 
 -- =====================================================
+-- Parent resolver (dengan verifikasi)
+-- =====================================================
+local function resolveParent()
+    if gethui then
+        local ok, hui = pcall(gethui)
+        if ok and typeof(hui) == "Instance" then
+            return hui, "gethui"
+        end
+    end
+    return player:WaitForChild("PlayerGui"), "PlayerGui"
+end
+
+-- Verifikasi parent dan paksa pindah kalau diturunkan
+local function ensureParented(sg, targetParent, label)
+    if not sg or not sg.Parent then return false end
+    if sg.Parent ~= targetParent then
+        log(string.format("UI diturunkan ke '%s' → kembalikan ke '%s'",
+            sg.Parent.Name, label))
+        pcall(function() sg.Parent = targetParent end)
+        task.wait(0.1)
+        return sg.Parent == targetParent
+    end
+    return true
+end
+
+-- =====================================================
 -- UI
 -- =====================================================
 local currentUI = nil
@@ -117,15 +133,36 @@ local function buildUI(opts)
     if currentUI then pcall(function() currentUI.destroy() end); currentUI = nil end
     destroyExistingUI()
 
-    local parent = getUIParent()
+    local targetParent, parentLabel = resolveParent()
+    log("Target parent:", parentLabel)
 
     local sg = Instance.new("ScreenGui")
     sg.Name = "AutoAFK_UI"
     sg.ResetOnSpawn = false
-    sg.DisplayOrder = 2147483647
     sg.IgnoreGuiInset = true
     sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    sg.Parent = parent
+    sg.DisplayOrder = 2147483647
+    sg.Parent = targetParent
+
+    -- Verifikasi setelah parent
+    log(string.format("Parent sekarang: %s | DisplayOrder=%d",
+        sg.Parent and sg.Parent.Name or "?", sg.DisplayOrder))
+
+    if sg.Parent ~= targetParent then
+        log("⚠️ ScreenGui dipindahkan oleh executor setelah parenting")
+    end
+
+    -- Watchdog: paksa tetap di gethui + reapply DisplayOrder
+    task.spawn(function()
+        while sg.Parent do
+            task.wait(CONFIG.WATCHDOG)
+            ensureParented(sg, targetParent, parentLabel)
+            if sg.DisplayOrder ~= 2147483647 then
+                pcall(function() sg.DisplayOrder = 2147483647 end)
+            end
+        end
+        log("Watchdog stop (UI destroyed)")
+    end)
 
     local height = opts.showTimer and 172 or 52
     local panel = Instance.new("Frame")
@@ -143,7 +180,7 @@ local function buildUI(opts)
     stroke.Thickness = 1.5; stroke.Transparency = 0.25; stroke.Parent = panel
 
     -- =====================================================
-    -- HEADER (drag handle ala ItemCatcher)
+    -- HEADER
     -- =====================================================
     local header = Instance.new("Frame")
     header.Name = "Header"
@@ -165,17 +202,15 @@ local function buildUI(opts)
     title.Size = UDim2.new(0, 160, 1, 0)
     title.Position = UDim2.new(0, 34, 0, 0)
     title.BackgroundTransparency = 1
-    title.Text = "AUTO AFK"
+    title.Text = "AUTO AFK  (RShift)"
     title.TextColor3 = Color3.fromRGB(240, 240, 250)
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Font = Enum.Font.GothamBold
-    title.TextSize = 14
+    title.TextSize = 13
     title.ZIndex = 12
     title.Parent = header
 
-    -- =====================================================
-    -- TOGGLE SWITCH (elemen terpisah, bukan header)
-    -- =====================================================
+    -- Toggle switch
     local toggleBtn = Instance.new("TextButton")
     toggleBtn.Name = "Toggle"
     toggleBtn.Size = UDim2.new(0, 76, 0, 28)
@@ -219,9 +254,7 @@ local function buildUI(opts)
     end
     applyVisuals(getgenv().AutoAFK_Enabled)
 
-    -- =====================================================
-    -- Timer section (AFK only)
-    -- =====================================================
+    -- Timer
     local timerLabel, barFill, subLabel
     local timerStart = opts.startTime or tick()
     local timerDuration = opts.duration or 0
@@ -308,7 +341,7 @@ local function buildUI(opts)
     if opts.showTimer then update() end
 
     -- =====================================================
-    -- DRAG — pola exact dari ItemCatcher
+    -- DRAG (ItemCatcher pattern)
     -- =====================================================
     local dragging, dragInput, dragStart, startPos
     header.InputBegan:Connect(function(input)
@@ -342,7 +375,7 @@ local function buildUI(opts)
     end)
 
     -- =====================================================
-    -- TOGGLE HANDLER (di tombol terpisah, tidak konflik dengan drag)
+    -- Toggle handler
     -- =====================================================
     local toggling = false
     local function onToggle()
@@ -379,8 +412,14 @@ local function buildUI(opts)
     end
 
     toggleBtn.MouseButton1Click:Connect(onToggle)
+    toggleBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            log("toggle InputBegan")
+            onToggle()
+        end
+    end)
 
-    -- Hover feedback
     toggleBtn.MouseEnter:Connect(function()
         TweenService:Create(toggleBtn, TweenInfo.new(0.12), {
             BackgroundTransparency = 0.15
@@ -395,16 +434,51 @@ local function buildUI(opts)
     currentUI = {
         destroy = function() pcall(function() sg:Destroy() end) end,
         update = update,
+        sg = sg,
     }
     return currentUI
 end
 
 -- =====================================================
+-- KEYBIND FALLBACK (RightShift)
+-- =====================================================
+-- Berfungsi meskipun UI tidak bisa diklik
+UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == CONFIG.KEYBIND then
+        log("Keybind " .. CONFIG.KEYBIND.Name .. " ditekan")
+        local newState = not getgenv().AutoAFK_Enabled
+        saveEnabled(newState)
+        log("Toggle via keybind →", newState and "ON" or "OFF")
+        if newState and game.PlaceId == CONFIG.PLACE_LOBBY then
+            task.spawn(function()
+                task.wait(CONFIG.GRACE_DELAY)
+                if getgenv().AutoAFK_Enabled then
+                    teleportTo(CONFIG.PLACE_AFK, "masuk AFK (keybind)")
+                end
+            end)
+        elseif not newState and game.PlaceId == CONFIG.PLACE_AFK then
+            task.spawn(function()
+                task.wait(0.5)
+                teleportTo(CONFIG.PLACE_LOBBY, "balik (keybind)")
+            end)
+        end
+        -- Update UI visual jika ada
+        if currentUI then
+            -- rebuild UI untuk update state visual (paling simpel)
+            local wasTimer = opts and opts.showTimer
+            -- (hindari rebuild, cukup update visuals via close+open)
+        end
+    end
+end)
+
+-- =====================================================
 -- MAIN
 -- =====================================================
-log("=== AUTO AFK v11 START | PlaceId:", game.PlaceId, "===")
+log("=== AUTO AFK v13 START | PlaceId:", game.PlaceId, "===")
 loadEnabled()
 log("State:", getgenv().AutoAFK_Enabled and "ON" or "OFF")
+log("Keybind toggle:", CONFIG.KEYBIND.Name)
 queueReload()
 
 if CONFIG.UI_ENABLED then
@@ -422,7 +496,7 @@ if CONFIG.UI_ENABLED then
 end
 
 if not getgenv().AutoAFK_Enabled then
-    log("State OFF — idle. Klik toggle untuk ON.")
+    log("State OFF — idle. Klik toggle / RShift untuk ON.")
     return
 end
 
