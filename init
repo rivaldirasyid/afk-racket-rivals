@@ -1,6 +1,6 @@
 -- =====================================================
--- AUTO AFK — RACKET RIVALS (v19 — FINAL SOLID)
--- UI Detection + Safe Buffer + Full Control (Toggle/Retry/Keybind)
+-- AUTO AFK — RACKET RIVALS (v20 — ULTIMATE MULTI-ACCOUNT)
+-- UI Detection + Safe Buffer + Toggle + Log + Stagger + Stats
 -- =====================================================
 local CONFIG = {
     PLACE_LOBBY  = 90906407195271,
@@ -12,22 +12,27 @@ local CONFIG = {
     -- Safe Buffer (2 Menit = 120 Detik)
     SAFE_BUFFER = 2 * 60, 
     
-    -- Fallback timer absolut (34 Menit = 30m target + 2m buffer + 2m safety)
+    -- Fallback timer absolut (34 Menit)
     FALLBACK_DURATION = 34 * 60, 
+    
+    -- Stagger Delay (Mencegah Rate Limit Teleport)
+    STAGGER_MAX_LOBBY = 25,  -- Detik (0-25s) saat masuk AFK
+    STAGGER_MAX_AFK   = 10,  -- Detik (0-10s) saat balik Lobby
     
     SCRIPT_URL   = "https://raw.githubusercontent.com/rivaldirasyid/afk-racket-rivals/refs/heads/main/init",
     DEBUG        = true,
     UI_ENABLED   = true,
 
-    -- File Paths
-    FILE_ENABLED   = "AutoAFK_racket_state.txt",
-    FILE_SESSION   = "AutoAFK_session.txt",
-    FILE_HEARTBEAT = "AutoAFK_heartbeat.txt",
+    -- Base File Paths (Akan ditambahi UserId)
+    FILE_ENABLED   = "AutoAFK_racket_state",
+    FILE_SESSION   = "AutoAFK_session",
+    FILE_HEARTBEAT = "AutoAFK_heartbeat",
+    FILE_STATS     = "AutoAFK_stats",
+    FILE_LOG       = "AutoAFK_log",
 
     -- Timing
     GRACE_DELAY     = 5,
     HEARTBEAT_EVERY = 10,
-    WATCHDOG_EVERY  = 3,
     POLL_RATE       = 1,
     RETRY_DELAYS    = {3, 10, 30},
 
@@ -45,11 +50,16 @@ local UIS             = game:GetService("UserInputService")
 local VU              = game:GetService("VirtualUser")
 local player          = Players.LocalPlayer
 
-local function log(...) if CONFIG.DEBUG then print("[AutoAFK]", ...) end end
+-- =====================================================
+-- MULTI-ACCOUNT FILE ISOLATION & LOGGING
+-- =====================================================
+local userSuffix = "_" .. tostring(player.UserId)
+CONFIG.FILE_ENABLED   = CONFIG.FILE_ENABLED .. userSuffix .. ".txt"
+CONFIG.FILE_SESSION   = CONFIG.FILE_SESSION .. userSuffix .. ".txt"
+CONFIG.FILE_HEARTBEAT = CONFIG.FILE_HEARTBEAT .. userSuffix .. ".txt"
+CONFIG.FILE_STATS     = CONFIG.FILE_STATS .. userSuffix .. ".txt"
+CONFIG.FILE_LOG       = CONFIG.FILE_LOG .. userSuffix .. ".txt"
 
--- =====================================================
--- File IO & State Management
--- =====================================================
 local FILE_IO = (writefile and readfile and isfile)
 
 local function writeSafe(path, content)
@@ -65,7 +75,56 @@ local function readSafe(path)
     return ok2 and content or nil
 end
 
--- Toggle ON/OFF State
+-- Log ke Console & File
+local function log(...)
+    local msg = table.concat({...}, " ")
+    if CONFIG.DEBUG then print("[AutoAFK]", msg) end
+    
+    if FILE_IO then
+        local timestamp = os.date("[%H:%M:%S] ")
+        local existing = readSafe(CONFIG.FILE_LOG) or ""
+        -- Rotate jika file > 100KB agar tidak membebani disk
+        if #existing > 100000 then existing = "[Log Rotated]\n" end
+        writeSafe(CONFIG.FILE_LOG, existing .. timestamp .. msg .. "\n")
+    end
+end
+
+-- =====================================================
+-- STATISTIK (Sessions, Runtime, Estimated Yen)
+-- =====================================================
+local Stats = { sessions = 0, runtime = 0, yen = 0 }
+
+local function loadStats()
+    local data = readSafe(CONFIG.FILE_STATS)
+    if data then
+        local s, r, y = data:match("^(%d+)|(%d+)|(%d+)$")
+        if s and r and y then
+            Stats.sessions = tonumber(s)
+            Stats.runtime = tonumber(r)
+            Stats.yen = tonumber(y)
+        end
+    end
+    log(string.format("Stats loaded: Sesi=%d, Runtime=%dh, Yen=%d", Stats.sessions, math.floor(Stats.runtime/3600), Stats.yen))
+end
+
+local function saveStats()
+    writeSafe(CONFIG.FILE_STATS, string.format("%d|%d|%d", Stats.sessions, Stats.runtime, Stats.yen))
+end
+
+local function addStatsRuntime(seconds)
+    Stats.runtime = Stats.runtime + seconds
+    saveStats()
+end
+
+local function addStatsSession(yenEarned)
+    Stats.sessions = Stats.sessions + 1
+    Stats.yen = Stats.yen + yenEarned
+    saveStats()
+end
+
+-- =====================================================
+-- STATE & SESSION MANAGEMENT
+-- =====================================================
 local function loadEnabled()
     if getgenv().AutoAFK_Loaded then return getgenv().AutoAFK_Enabled end
     local state = true
@@ -81,7 +140,6 @@ local function saveEnabled(state)
     writeSafe(CONFIG.FILE_ENABLED, state and "on" or "off")
 end
 
--- Session Persistence
 local function saveSession(mode, startTime)
     local t = startTime or os.time()
     writeSafe(CONFIG.FILE_SESSION, string.format("%s|%d", mode, t))
@@ -107,13 +165,8 @@ local function clearSession()
     getgenv().AutoAFK_SessionData = nil
 end
 
--- Heartbeat
-task.spawn(function()
-    while true do writeSafe(CONFIG.FILE_HEARTBEAT, tostring(os.time())); task.wait(CONFIG.HEARTBEAT_EVERY) end
-end)
-
 -- =====================================================
--- Anti-Idle
+-- ANTI-IDLE & HEARTBEAT
 -- =====================================================
 local lastAntiIdle = 0
 local function performAntiIdle()
@@ -128,13 +181,26 @@ task.spawn(function()
     while true do performAntiIdle(); task.wait(CONFIG.ANTI_IDLE_INTERVAL) end
 end)
 
+task.spawn(function()
+    while true do writeSafe(CONFIG.FILE_HEARTBEAT, tostring(os.time())); task.wait(CONFIG.HEARTBEAT_EVERY) end
+end)
+
 -- =====================================================
--- Teleport & Reload
+-- TELEPORT & STAGGER LOGIC
 -- =====================================================
 local function queueReload()
     if CONFIG.SCRIPT_URL == "" then return end
     local code = string.format('task.wait(3) loadstring(game:HttpGet("%s"))()', CONFIG.SCRIPT_URL)
     pcall(function() if queue_on_teleport then queue_on_teleport(code) end end)
+end
+
+-- Fungsi Stagger untuk Multi-Account
+local function doStaggerWait(maxDelay, label)
+    local delay = player.UserId % (maxDelay + 1)
+    if delay > 0 then
+        log(string.format("Stagger Delay (%s): Menunggu %d detik...", label, delay))
+        task.wait(delay)
+    end
 end
 
 local function teleportTo(placeId, label)
@@ -153,16 +219,14 @@ local function teleportTo(placeId, label)
             local ok = pcall(method.fn)
             log(string.format("  [%d] %s -> %s", attempt, method.name, tostring(ok)))
             if ok then return true end
-            if attempt < #methods * #CONFIG.RETRY_DELAYS then
-                task.wait(delay)
-            end
+            if attempt < #methods * #CONFIG.RETRY_DELAYS then task.wait(delay) end
         end
     end
     return false
 end
 
 -- =====================================================
--- UI Detection (With Typecheck Bug Fix)
+-- UI DETECTION
 -- =====================================================
 local function isRewardCollected()
     local pg = player:FindFirstChild("PlayerGui")
@@ -174,20 +238,17 @@ local function isRewardCollected()
         if not current then return false, "Path not found" end
     end
     
-    -- FIX BUG: Pastikan tipenya TextLabel atau TextBox
     if not (current:IsA("TextLabel") or current:IsA("TextBox")) then
         return false, "Invalid UI Type"
     end
     
     local txt = current.Text:lower()
-    if txt:find("collected") then
-        return true, current.Text
-    end
+    if txt:find("collected") then return true, current.Text end
     return false, current.Text
 end
 
 -- =====================================================
--- UI Builder
+-- UI BUILDER (Dengan Stats & Toggle)
 -- =====================================================
 local currentUI = nil
 local currentState = { onRetry = nil }
@@ -216,8 +277,8 @@ local function buildUI(opts)
     sg.IgnoreGuiInset = true
     sg.Parent = parent
 
-    local height = 52
-    if opts.showTimer then height = 140 end
+    local height = 80 -- Base height (Header + Stats)
+    if opts.showTimer then height = 165 end
     if opts.showRetry then height = height + 40 end
 
     local panel = Instance.new("Frame")
@@ -230,7 +291,7 @@ local function buildUI(opts)
     local stroke = Instance.new("UIStroke", panel)
     stroke.Color = Color3.fromRGB(255, 200, 60)
 
-    -- ================= HEADER & TOGGLE =================
+    -- HEADER & TOGGLE
     local header = Instance.new("Frame", panel)
     header.Size = UDim2.new(1, 0, 0, 52)
     header.BackgroundTransparency = 1
@@ -246,13 +307,12 @@ local function buildUI(opts)
     title.Size = UDim2.new(1, -100, 1, 0)
     title.Position = UDim2.new(0, 34, 0, 0)
     title.BackgroundTransparency = 1
-    title.Text = "AUTO AFK (v19)"
+    title.Text = "AUTO AFK (v20)"
     title.TextColor3 = Color3.fromRGB(240, 240, 250)
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Font = Enum.Font.GothamBold
     title.TextSize = 13
 
-    -- Toggle Switch
     local toggleBtn = Instance.new("TextButton", header)
     toggleBtn.Size = UDim2.new(0, 76, 0, 28)
     toggleBtn.Position = UDim2.new(1, -86, 0.5, -14)
@@ -275,12 +335,24 @@ local function buildUI(opts)
     knobText.Font = Enum.Font.GothamBold
     knobText.TextSize = 9
 
-    -- Timer Info
+    -- STATS LABEL (Selalu ada)
+    local statsLabel = Instance.new("TextLabel", panel)
+    statsLabel.Size = UDim2.new(1, -28, 0, 20)
+    statsLabel.Position = UDim2.new(0, 14, 0, 56)
+    statsLabel.BackgroundTransparency = 1
+    statsLabel.Text = string.format("Sesi: %d | Runtime: %dh %dm | Est. Yen: %d", 
+        Stats.sessions, math.floor(Stats.runtime/3600), math.floor((Stats.runtime%3600)/60), Stats.yen)
+    statsLabel.TextColor3 = Color3.fromRGB(130, 150, 180)
+    statsLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statsLabel.Font = Enum.Font.GothamMedium
+    statsLabel.TextSize = 11
+
+    -- TIMER INFO (Hanya di AFK Room)
     local infoLabel, subLabel
     if opts.showTimer then
         infoLabel = Instance.new("TextLabel", panel)
         infoLabel.Size = UDim2.new(1, -28, 0, 20)
-        infoLabel.Position = UDim2.new(0, 14, 0, 56)
+        infoLabel.Position = UDim2.new(0, 14, 0, 78)
         infoLabel.BackgroundTransparency = 1
         infoLabel.Text = "Memantau UI Game..."
         infoLabel.TextColor3 = Color3.fromRGB(255, 220, 80)
@@ -290,7 +362,7 @@ local function buildUI(opts)
         
         subLabel = Instance.new("TextLabel", panel)
         subLabel.Size = UDim2.new(1, -28, 0, 16)
-        subLabel.Position = UDim2.new(0, 14, 0, 78)
+        subLabel.Position = UDim2.new(0, 14, 0, 100)
         subLabel.BackgroundTransparency = 1
         subLabel.Text = "Menunggu 'collected this session'..."
         subLabel.TextColor3 = Color3.fromRGB(160, 160, 180)
@@ -299,7 +371,7 @@ local function buildUI(opts)
         subLabel.TextSize = 11
     end
 
-    -- Retry Button (Jika stuck)
+    -- RETRY BUTTON
     local retryBtn
     if opts.showRetry then
         retryBtn = Instance.new("TextButton", panel)
@@ -317,7 +389,6 @@ local function buildUI(opts)
         end)
     end
 
-    -- Function Update Visual Toggle
     local function applyVisuals(state)
         local onC, offC = Color3.fromRGB(80, 220, 120), Color3.fromRGB(220, 80, 80)
         dot.BackgroundColor3 = state and onC or offC
@@ -328,7 +399,6 @@ local function buildUI(opts)
         stroke.Color = state and onC or offC
     end
 
-    -- Function Toggle Handler
     local toggling = false
     local function onToggle()
         if toggling then return end
@@ -351,11 +421,10 @@ local function buildUI(opts)
 
     toggleBtn.MouseButton1Click:Connect(onToggle)
     toggleBtn.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then onToggle() end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then onToggle() end
     end)
 
-    -- Drag Logic
+    -- Drag
     local dragging, dragStart, startPos
     header.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -374,27 +443,23 @@ local function buildUI(opts)
         if infoLabel then
             infoLabel.Text = mainText
             if subLabel then subLabel.Text = subText end
-            
             local color = Color3.fromRGB(255, 220, 80)
             if statusType == "buffer" then color = Color3.fromRGB(255, 140, 60)
             elseif statusType == "ready" then color = Color3.fromRGB(80, 220, 120) end
-            
             infoLabel.TextColor3 = color
             stroke.Color = color
             dot.BackgroundColor3 = color
         end
     end
 
-    currentUI = {
-        destroy = function() sg:Destroy() end,
-        updateStatus = updateStatus
-    }
+    currentUI = { destroy = function() sg:Destroy() end, updateStatus = updateStatus }
 end
 
 -- =====================================================
 -- MAIN LOGIC
 -- =====================================================
 loadEnabled()
+loadStats()
 queueReload()
 
 if game.PlaceId == CONFIG.PLACE_LOBBY then
@@ -409,6 +474,7 @@ if game.PlaceId == CONFIG.PLACE_LOBBY then
     task.wait(CONFIG.GRACE_DELAY)
     
     if getgenv().AutoAFK_Enabled then
+        doStaggerWait(CONFIG.STAGGER_MAX_LOBBY, "Masuk AFK") -- ⭐ FITUR STAGGER
         saveSession("lobby", os.time())
         teleportTo(CONFIG.PLACE_AFK, "masuk AFK")
     end
@@ -452,11 +518,7 @@ elseif game.PlaceId == CONFIG.PLACE_AFK then
         
         if currentUI and (elapsed % 2 == 0) then
             local sisa = math.max(0, 1800 - elapsed)
-            currentUI.updateStatus(
-                string.format("Sisa %02d:%02d", math.floor(sisa/60), sisa%60), 
-                "UI Game: " .. (currentText or "?"),
-                "normal"
-            )
+            currentUI.updateStatus(string.format("Sisa %02d:%02d", math.floor(sisa/60), sisa%60), "UI Game: " .. (currentText or "?"), "normal")
         end
     end
     
@@ -465,17 +527,12 @@ elseif game.PlaceId == CONFIG.PLACE_AFK then
         log(string.format("Fase 2: Safe Buffer %ds...", CONFIG.SAFE_BUFFER))
         while getgenv().AutoAFK_Enabled do
             task.wait(CONFIG.POLL_RATE)
-            
             local bufferElapsed = os.time() - detectionTime
             local bufferRemaining = CONFIG.SAFE_BUFFER - bufferElapsed
-            
             if bufferRemaining <= 0 then break end
             
             if currentUI then
-                currentUI.updateStatus(
-                    string.format("Buffer: %02d:%02d", math.floor(bufferRemaining/60), bufferRemaining%60),
-                    "Reward aman. Menunggu jeda...", "buffer"
-                )
+                currentUI.updateStatus(string.format("Buffer: %02d:%02d", math.floor(bufferRemaining/60), bufferRemaining%60), "Reward aman. Menunggu jeda...", "buffer")
             end
         end
     end
@@ -483,9 +540,17 @@ elseif game.PlaceId == CONFIG.PLACE_AFK then
     -- ================= FASE 3: EXIT =================
     if getgenv().AutoAFK_Enabled then
         if currentUI then currentUI.updateStatus("✅ KELUAR", "Pindah ke Lobby...", "ready") end
+        
+        -- Update Stats (Hitung berapa lama sesi ini berjalan)
+        local totalSessionTime = os.time() - sessStart
+        addStatsSession(400) -- Tambah 1 sesi, +400 Yen
+        addStatsRuntime(totalSessionTime) -- Tambah runtime
+        
         task.wait(1)
         clearSession()
         queueReload()
+        
+        doStaggerWait(CONFIG.STAGGER_MAX_AFK, "Keluar AFK") -- ⭐ FITUR STAGGER
         
         local success = teleportTo(CONFIG.PLACE_LOBBY, "balik ke Lobby")
         if not success then
@@ -493,14 +558,11 @@ elseif game.PlaceId == CONFIG.PLACE_AFK then
             if CONFIG.UI_ENABLED then
                 buildUI({ showTimer = false, showRetry = true })
                 currentState.onRetry = function()
-                    if teleportTo(CONFIG.PLACE_LOBBY, "manual retry") then
-                        clearSession()
-                    end
+                    if teleportTo(CONFIG.PLACE_LOBBY, "manual retry") then clearSession() end
                 end
             end
         end
     end
-
 else
     log("PlaceId tidak dikenal.")
 end
