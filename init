@@ -1,823 +1,568 @@
---[[
-    AUTO AFK - RACKET RIVALS v22
-    Lifecycle rebuild: strict OFF, single worker, cleanup, persistent state.
-
-    Catatan:
-    - Memerlukan executor yang mendukung getgenv().
-    - File API (readfile/writefile/isfile) dan queue_on_teleport bersifat opsional.
-    - Tidak menonaktifkan koneksi Idled milik script/game lain.
-    - Uji di environment pribadi terlebih dahulu. Tidak ada jaminan kompatibilitas
-      terhadap perubahan game atau executor di masa mendatang.
-]]
-
+-- =====================================================
+-- AUTO AFK — RACKET RIVALS (v20 — ULTIMATE MULTI-ACCOUNT)
+-- UI Detection + Safe Buffer + Toggle + Log + Stagger + Stats
+-- =====================================================
 local CONFIG = {
-    PLACE_LOBBY = 90906407195271,
-    PLACE_AFK = 82492382424045,
-
+    PLACE_LOBBY  = 90906407195271,
+    PLACE_AFK    = 82492382424045,
+    
+    -- Path UI Target (400 Yen)
     UI_PATH = "PAGES.AfkLobbyPage.Content.Body.Earnings.TimerCard.GuaranteeStrip.Body.Note",
+    
+    -- Safe Buffer (2 Menit = 120 Detik)
+    SAFE_BUFFER = 2 * 60, 
+    
+    -- Fallback timer absolut (34 Menit)
+    FALLBACK_DURATION = 34 * 60, 
+    
+    -- Stagger Delay (Mencegah Rate Limit Teleport)
+    STAGGER_MAX_LOBBY = 25,  -- Detik (0-25s) saat masuk AFK
+    STAGGER_MAX_AFK   = 10,  -- Detik (0-10s) saat balik Lobby
+    
+    SCRIPT_URL   = "https://raw.githubusercontent.com/rivaldirasyid/afk-racket-rivals/refs/heads/main/init",
+    DEBUG        = true,
+    UI_ENABLED   = true,
 
-    SAFE_BUFFER = 120,
-    FALLBACK_DURATION = 34 * 60,
-    GRACE_DELAY = 5,
-    STAGGER_MAX_LOBBY = 25,
-    STAGGER_MAX_AFK = 10,
+    -- Base File Paths (Akan ditambahi UserId)
+    FILE_ENABLED   = "AutoAFK_racket_state",
+    FILE_SESSION   = "AutoAFK_session",
+    FILE_HEARTBEAT = "AutoAFK_heartbeat",
+    FILE_STATS     = "AutoAFK_stats",
+    FILE_LOG       = "AutoAFK_log",
 
-    POLL_RATE = 1,
-    UI_REFRESH_RATE = 1,
+    -- Timing
+    GRACE_DELAY     = 5,
     HEARTBEAT_EVERY = 10,
-    ANTI_IDLE_INTERVAL = 55,
+    POLL_RATE       = 1,
+    RETRY_DELAYS    = {3, 10, 30},
 
-    RETRY_DELAYS = {3, 10, 30},
-    REWARD_YEN = 400,
+    -- Anti-idle
+    ANTI_IDLE_INTERVAL = 55,
+    ANTI_IDLE_THROTTLE = 1,
+    ANTI_IDLE_WARMUP   = 10,
 
     KEYBIND = Enum.KeyCode.RightShift,
-    UI_ENABLED = true,
-    DEBUG = true,
-
-    SCRIPT_URL = "https://raw.githubusercontent.com/rivaldirasyid/afk-racket-rivals/refs/heads/main/init",
-
-    FILE_PREFIX = "AutoAFK_RR_v22",
 }
 
---// Services
-local Players = game:GetService("Players")
+local Players         = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
-local UserInputService = game:GetService("UserInputService")
-local VirtualUser = game:GetService("VirtualUser")
+local UIS             = game:GetService("UserInputService")
+local VU              = game:GetService("VirtualUser")
+local player          = Players.LocalPlayer
 
-local player = Players.LocalPlayer
-local genv = getgenv and getgenv() or _G
-local suffix = "_" .. tostring(player.UserId)
+-- =====================================================
+-- MULTI-ACCOUNT FILE ISOLATION & LOGGING
+-- =====================================================
+local userSuffix = "_" .. tostring(player.UserId)
+CONFIG.FILE_ENABLED   = CONFIG.FILE_ENABLED .. userSuffix .. ".txt"
+CONFIG.FILE_SESSION   = CONFIG.FILE_SESSION .. userSuffix .. ".txt"
+CONFIG.FILE_HEARTBEAT = CONFIG.FILE_HEARTBEAT .. userSuffix .. ".txt"
+CONFIG.FILE_STATS     = CONFIG.FILE_STATS .. userSuffix .. ".txt"
+CONFIG.FILE_LOG       = CONFIG.FILE_LOG .. userSuffix .. ".txt"
 
-local FILES = {
-    enabled = CONFIG.FILE_PREFIX .. "_enabled" .. suffix .. ".txt",
-    session = CONFIG.FILE_PREFIX .. "_session" .. suffix .. ".txt",
-    stats = CONFIG.FILE_PREFIX .. "_stats" .. suffix .. ".txt",
-    heartbeat = CONFIG.FILE_PREFIX .. "_heartbeat" .. suffix .. ".txt",
-    log = CONFIG.FILE_PREFIX .. "_log" .. suffix .. ".txt",
-}
+local FILE_IO = (writefile and readfile and isfile)
 
-local fileAvailable =
-    type(writefile) == "function"
-    and type(readfile) == "function"
-    and type(isfile) == "function"
-
-local function safeCall(fn, ...)
-    if type(fn) ~= "function" then
-        return false, "function unavailable"
-    end
-    return pcall(fn, ...)
+local function writeSafe(path, content)
+    if not FILE_IO then return false end
+    return pcall(writefile, path, content)
 end
 
-local function writeFile(path, content)
-    if not fileAvailable then return false end
-    local ok = pcall(writefile, path, tostring(content))
-    return ok
-end
-
-local function readFile(path)
-    if not fileAvailable then return nil end
+local function readSafe(path)
+    if not FILE_IO then return nil end
     local ok, exists = pcall(isfile, path)
     if not ok or not exists then return nil end
-    local readOk, result = pcall(readfile, path)
-    if readOk then return result end
-    return nil
+    local ok2, content = pcall(readfile, path)
+    return ok2 and content or nil
 end
 
---// Stop a previous copy cleanly before creating this runtime.
-local previous = genv.AutoAFK_V22_Runtime
-if type(previous) == "table" and type(previous.Stop) == "function" then
-    pcall(previous.Stop, "replaced by a new script instance")
-end
-
-local Runtime = {
-    alive = true,
-    enabled = false,
-    worker = nil,
-    heartbeatWorker = nil,
-    antiIdleConnection = nil,
-    uiConnections = {},
-    ui = nil,
-    lastAntiIdle = 0,
-    lastHeartbeat = 0,
-    session = nil,
-    stats = { sessions = 0, runtime = 0, yen = 0 },
-    lastError = nil,
-}
-genv.AutoAFK_V22_Runtime = Runtime
-
+-- Log ke Console & File
 local function log(...)
-    local parts = {}
-    for i = 1, select("#", ...) do
-        parts[#parts + 1] = tostring(select(i, ...))
-    end
-    local message = table.concat(parts, " ")
-    if CONFIG.DEBUG then
-        print("[AutoAFK v22] " .. message)
-    end
-
-    local line = os.date("[%Y-%m-%d %H:%M:%S] ") .. message .. "\n"
-    if fileAvailable then
-        local old = readFile(FILES.log) or ""
-        if #old > 100000 then old = "[log rotated]\n" end
-        writeFile(FILES.log, old .. line)
+    local msg = table.concat({...}, " ")
+    if CONFIG.DEBUG then print("[AutoAFK]", msg) end
+    
+    if FILE_IO then
+        local timestamp = os.date("[%H:%M:%S] ")
+        local existing = readSafe(CONFIG.FILE_LOG) or ""
+        -- Rotate jika file > 100KB agar tidak membebani disk
+        if #existing > 100000 then existing = "[Log Rotated]\n" end
+        writeSafe(CONFIG.FILE_LOG, existing .. timestamp .. msg .. "\n")
     end
 end
 
-local function loadEnabled()
-    local value = readFile(FILES.enabled)
-    if value then
-        value = value:lower():gsub("%s+", "")
-        return value == "on" or value == "true" or value == "1"
-    end
-    return true
-end
-
-local function saveEnabled(value)
-    Runtime.enabled = value == true
-    genv.AutoAFK_Enabled = Runtime.enabled
-    writeFile(FILES.enabled, Runtime.enabled and "on" or "off")
-end
+-- =====================================================
+-- STATISTIK (Sessions, Runtime, Estimated Yen)
+-- =====================================================
+local Stats = { sessions = 0, runtime = 0, yen = 0 }
 
 local function loadStats()
-    local raw = readFile(FILES.stats)
-    if not raw then return end
-    local sessions, runtime, yen = raw:match("^(%d+)|(%d+)|(%d+)$")
-    if sessions then
-        Runtime.stats.sessions = tonumber(sessions) or 0
-        Runtime.stats.runtime = tonumber(runtime) or 0
-        Runtime.stats.yen = tonumber(yen) or 0
+    local data = readSafe(CONFIG.FILE_STATS)
+    if data then
+        local s, r, y = data:match("^(%d+)|(%d+)|(%d+)$")
+        if s and r and y then
+            Stats.sessions = tonumber(s)
+            Stats.runtime = tonumber(r)
+            Stats.yen = tonumber(y)
+        end
     end
+    log(string.format("Stats loaded: Sesi=%d, Runtime=%dh, Yen=%d", Stats.sessions, math.floor(Stats.runtime/3600), Stats.yen))
 end
 
 local function saveStats()
-    local s = Runtime.stats
-    writeFile(FILES.stats, string.format("%d|%d|%d", s.sessions, s.runtime, s.yen))
+    writeSafe(CONFIG.FILE_STATS, string.format("%d|%d|%d", Stats.sessions, Stats.runtime, Stats.yen))
 end
 
-local function saveSession(mode, startedAt, rewardClaimed, detectedAt, statsCredited)
-    Runtime.session = {
-        mode = mode,
-        startedAt = startedAt or os.time(),
-        rewardClaimed = rewardClaimed == true,
-        detectedAt = detectedAt,
-        statsCredited = statsCredited == true,
-    }
-    writeFile(FILES.session, string.format(
-        "%s|%d|%d|%d|%d",
-        Runtime.session.mode,
-        Runtime.session.startedAt,
-        Runtime.session.rewardClaimed and 1 or 0,
-        Runtime.session.detectedAt or 0,
-        Runtime.session.statsCredited and 1 or 0
-    ))
+local function addStatsRuntime(seconds)
+    Stats.runtime = Stats.runtime + seconds
+    saveStats()
+end
+
+local function addStatsSession(yenEarned)
+    Stats.sessions = Stats.sessions + 1
+    Stats.yen = Stats.yen + yenEarned
+    saveStats()
+end
+
+-- =====================================================
+-- STATE & SESSION MANAGEMENT
+-- =====================================================
+local function loadEnabled()
+    if getgenv().AutoAFK_Loaded then return getgenv().AutoAFK_Enabled end
+    local state = true
+    local content = readSafe(CONFIG.FILE_ENABLED)
+    if content then state = (content:lower():find("on") ~= nil) end
+    getgenv().AutoAFK_Enabled = state
+    getgenv().AutoAFK_Loaded = true
+    return state
+end
+
+local function saveEnabled(state)
+    getgenv().AutoAFK_Enabled = state
+    writeSafe(CONFIG.FILE_ENABLED, state and "on" or "off")
+end
+
+local function saveSession(mode, startTime)
+    local t = startTime or os.time()
+    writeSafe(CONFIG.FILE_SESSION, string.format("%s|%d", mode, t))
+    getgenv().AutoAFK_SessionData = {mode = mode, startTime = t}
+    log(string.format("Session [%s] disimpan (start=%s)", mode, os.date("%H:%M:%S", t)))
 end
 
 local function loadSession()
-    local raw = readFile(FILES.session)
-    if not raw then return nil end
-    local mode, startedAt, claimed, detectedAt, credited =
-        raw:match("^([^|]+)|(%d+)|(%d+)|(%d+)|(%d+)$")
-    if not mode or not startedAt then
-        -- Backward compatibility with v21/v22 early session format.
-        mode, startedAt, claimed = raw:match("^([^|]+)|(%d+)|(%d+)$")
-        if not mode or not startedAt then return nil end
-        detectedAt, credited = "0", "0"
+    local backup = getgenv().AutoAFK_SessionData
+    if backup and backup.mode and backup.startTime then
+        return backup.mode, backup.startTime, "getgenv"
     end
-    return {
-        mode = mode,
-        startedAt = tonumber(startedAt),
-        rewardClaimed = claimed == "1",
-        detectedAt = tonumber(detectedAt) > 0 and tonumber(detectedAt) or nil,
-        statsCredited = credited == "1",
-    }
+    local content = readSafe(CONFIG.FILE_SESSION)
+    if content and content ~= "" then
+        local mode, ts = content:match("^([^|]+)|(%d+)$")
+        if mode and ts then return mode, tonumber(ts), "file" end
+    end
+    return nil
 end
 
 local function clearSession()
-    Runtime.session = nil
-    writeFile(FILES.session, "")
+    writeSafe(CONFIG.FILE_SESSION, "")
+    getgenv().AutoAFK_SessionData = nil
 end
 
-local function isEnabled()
-    return Runtime.alive and Runtime.enabled
+-- =====================================================
+-- ANTI-IDLE & HEARTBEAT
+-- =====================================================
+local lastAntiIdle = 0
+local function performAntiIdle()
+    if tick() - lastAntiIdle < CONFIG.ANTI_IDLE_THROTTLE then return end
+    lastAntiIdle = tick()
+    pcall(function() VU:CaptureController(); VU:ClickButton2(Vector2.new(0, 0)) end)
 end
 
-local function updateStatus(mainText, subText, status)
-    if not Runtime.ui then return end
-    pcall(function()
-        Runtime.ui.updateStatus(mainText, subText, status)
-    end)
+player.Idled:Connect(performAntiIdle)
+task.spawn(function()
+    task.wait(CONFIG.ANTI_IDLE_WARMUP)
+    while true do performAntiIdle(); task.wait(CONFIG.ANTI_IDLE_INTERVAL) end
+end)
+
+task.spawn(function()
+    while true do writeSafe(CONFIG.FILE_HEARTBEAT, tostring(os.time())); task.wait(CONFIG.HEARTBEAT_EVERY) end
+end)
+
+-- =====================================================
+-- TELEPORT & STAGGER LOGIC
+-- =====================================================
+local function queueReload()
+    if CONFIG.SCRIPT_URL == "" then return end
+    local code = string.format('task.wait(3) loadstring(game:HttpGet("%s"))()', CONFIG.SCRIPT_URL)
+    pcall(function() if queue_on_teleport then queue_on_teleport(code) end end)
 end
 
-local function updateStatsLabel(message)
-    if not Runtime.ui then return end
-    pcall(function()
-        Runtime.ui.setStats(message)
-    end)
-end
-
-local function formatStats()
-    local s = Runtime.stats
-    return string.format(
-        "Sesi: %d | Runtime: %dh %dm | Est. Yen: %d",
-        s.sessions,
-        math.floor(s.runtime / 3600),
-        math.floor((s.runtime % 3600) / 60),
-        s.yen
-    )
-end
-
---// UI
-local function disconnectUIConnections()
-    for _, connection in ipairs(Runtime.uiConnections) do
-        pcall(function() connection:Disconnect() end)
+-- Fungsi Stagger untuk Multi-Account
+local function doStaggerWait(maxDelay, label)
+    local delay = player.UserId % (maxDelay + 1)
+    if delay > 0 then
+        log(string.format("Stagger Delay (%s): Menunggu %d detik...", label, delay))
+        task.wait(delay)
     end
-    table.clear(Runtime.uiConnections)
 end
 
-local function destroyUI()
-    disconnectUIConnections()
-    if Runtime.ui then
-        pcall(function() Runtime.ui.destroy() end)
-        Runtime.ui = nil
+local function teleportTo(placeId, label)
+    log(string.format("Teleport ke %d (%s)...", placeId, label))
+    local methods = {
+        { name = "Teleport", fn = function() TeleportService:Teleport(placeId, player) end },
+        { name = "TeleportAsync", fn = function()
+            if TeleportService.TeleportAsync then TeleportService:TeleportAsync(placeId, {player})
+            else error("no TeleportAsync") end
+        end },
+    }
+    local attempt = 0
+    for _, method in ipairs(methods) do
+        for _, delay in ipairs(CONFIG.RETRY_DELAYS) do
+            attempt = attempt + 1
+            local ok = pcall(method.fn)
+            log(string.format("  [%d] %s -> %s", attempt, method.name, tostring(ok)))
+            if ok then return true end
+            if attempt < #methods * #CONFIG.RETRY_DELAYS then task.wait(delay) end
+        end
     end
+    return false
+end
 
-    local pg = player:FindFirstChildOfClass("PlayerGui")
-    if pg then
-        local old = pg:FindFirstChild("AutoAFK_UI")
-        if old then old:Destroy() end
+-- =====================================================
+-- UI DETECTION
+-- =====================================================
+local function isRewardCollected()
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return false, "No PlayerGui" end
+    
+    local current = pg
+    for segment in CONFIG.UI_PATH:gmatch("[^%.]+") do
+        current = current:FindFirstChild(segment)
+        if not current then return false, "Path not found" end
     end
+    
+    if not (current:IsA("TextLabel") or current:IsA("TextBox")) then
+        return false, "Invalid UI Type"
+    end
+    
+    local txt = current.Text:lower()
+    if txt:find("collected") then return true, current.Text end
+    return false, current.Text
+end
 
-    if type(gethui) == "function" then
+-- =====================================================
+-- UI BUILDER (Dengan Stats & Toggle)
+-- =====================================================
+local currentUI = nil
+local currentState = { onRetry = nil }
+
+local function destroyExistingUI()
+    local pg = player:FindFirstChild("PlayerGui")
+    if pg and pg:FindFirstChild("AutoAFK_UI") then pg.AutoAFK_UI:Destroy() end
+    if gethui then
         pcall(function()
             local hui = gethui()
-            local old = hui and hui:FindFirstChild("AutoAFK_UI")
-            if old then old:Destroy() end
+            if hui and hui:FindFirstChild("AutoAFK_UI") then hui.AutoAFK_UI:Destroy() end
         end)
     end
 end
 
-local function buildUI()
-    if not CONFIG.UI_ENABLED then return end
-    destroyUI()
+local function buildUI(opts)
+    opts = opts or {}
+    if currentUI then pcall(function() currentUI.destroy() end) end
+    destroyExistingUI()
+    
+    local parent = gethui and gethui() or player:WaitForChild("PlayerGui")
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "AutoAFK_UI"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 2147483647
+    sg.IgnoreGuiInset = true
+    sg.Parent = parent
 
-    local parent
-    if type(gethui) == "function" then
-        local ok, hui = pcall(gethui)
-        if ok and hui then parent = hui end
-    end
-    parent = parent or player:WaitForChild("PlayerGui")
-
-    local screen = Instance.new("ScreenGui")
-    screen.Name = "AutoAFK_UI"
-    screen.ResetOnSpawn = false
-    screen.DisplayOrder = 10000
-    screen.IgnoreGuiInset = true
-    screen.Parent = parent
+    local height = 80 -- Base height (Header + Stats)
+    if opts.showTimer then height = 165 end
+    if opts.showRetry then height = height + 40 end
 
     local panel = Instance.new("Frame")
-    panel.Name = "Panel"
-    panel.Size = UDim2.fromOffset(330, 126)
-    panel.Position = UDim2.new(1, -350, 0, 24)
-    panel.BackgroundColor3 = Color3.fromRGB(20, 22, 29)
-    panel.BackgroundTransparency = 0.05
-    panel.BorderSizePixel = 0
-    panel.Parent = screen
+    panel.Size = UDim2.new(0, 320, 0, height)
+    panel.Position = UDim2.new(1, -340, 0, 20)
+    panel.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+    panel.BackgroundTransparency = 0.1
+    panel.Parent = sg
     Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
+    local stroke = Instance.new("UIStroke", panel)
+    stroke.Color = Color3.fromRGB(255, 200, 60)
 
-    local stroke = Instance.new("UIStroke")
-    stroke.Thickness = 1.5
-    stroke.Color = Color3.fromRGB(80, 220, 120)
-    stroke.Parent = panel
-
-    local header = Instance.new("Frame")
-    header.Size = UDim2.new(1, 0, 0, 48)
+    -- HEADER & TOGGLE
+    local header = Instance.new("Frame", panel)
+    header.Size = UDim2.new(1, 0, 0, 52)
     header.BackgroundTransparency = 1
     header.Active = true
-    header.Parent = panel
 
-    local dot = Instance.new("Frame")
-    dot.Size = UDim2.fromOffset(9, 9)
-    dot.Position = UDim2.fromOffset(15, 19)
-    dot.BorderSizePixel = 0
+    local dot = Instance.new("Frame", header)
+    dot.Size = UDim2.new(0, 10, 0, 10)
+    dot.Position = UDim2.new(0, 16, 0.5, -5)
     dot.BackgroundColor3 = Color3.fromRGB(80, 220, 120)
-    dot.Parent = header
     Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
 
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -120, 1, 0)
-    title.Position = UDim2.fromOffset(31, 0)
+    local title = Instance.new("TextLabel", header)
+    title.Size = UDim2.new(1, -100, 1, 0)
+    title.Position = UDim2.new(0, 34, 0, 0)
     title.BackgroundTransparency = 1
-    title.Text = "AUTO AFK  |  v22"
-    title.TextColor3 = Color3.fromRGB(245, 245, 250)
+    title.Text = "AUTO AFK (v20)"
+    title.TextColor3 = Color3.fromRGB(240, 240, 250)
+    title.TextXAlignment = Enum.TextXAlignment.Left
     title.Font = Enum.Font.GothamBold
     title.TextSize = 13
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = header
 
-    local toggle = Instance.new("TextButton")
-    toggle.Name = "Toggle"
-    toggle.Size = UDim2.fromOffset(76, 28)
-    toggle.Position = UDim2.new(1, -88, 0.5, -14)
-    toggle.AutoButtonColor = false
-    toggle.BorderSizePixel = 0
-    toggle.Text = ""
-    toggle.Parent = header
-    Instance.new("UICorner", toggle).CornerRadius = UDim.new(1, 0)
+    local toggleBtn = Instance.new("TextButton", header)
+    toggleBtn.Size = UDim2.new(0, 76, 0, 28)
+    toggleBtn.Position = UDim2.new(1, -86, 0.5, -14)
+    toggleBtn.BackgroundColor3 = getgenv().AutoAFK_Enabled and Color3.fromRGB(80, 220, 120) or Color3.fromRGB(80, 80, 90)
+    toggleBtn.Text = ""
+    toggleBtn.AutoButtonColor = false
+    Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(1, 0)
 
-    local knob = Instance.new("Frame")
-    knob.Size = UDim2.fromOffset(22, 22)
-    knob.BorderSizePixel = 0
-    knob.BackgroundColor3 = Color3.new(1, 1, 1)
-    knob.Parent = toggle
+    local knob = Instance.new("Frame", toggleBtn)
+    knob.Size = UDim2.new(0, 22, 0, 22)
+    knob.Position = getgenv().AutoAFK_Enabled and UDim2.new(1, -25, 0.5, -11) or UDim2.new(0, 3, 0.5, -11)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
 
-    local toggleText = Instance.new("TextLabel")
-    toggleText.Size = UDim2.new(1, 0, 1, 0)
-    toggleText.BackgroundTransparency = 1
-    toggleText.Font = Enum.Font.GothamBold
-    toggleText.TextSize = 9
-    toggleText.Parent = toggle
+    local knobText = Instance.new("TextLabel", toggleBtn)
+    knobText.Size = UDim2.new(1, 0, 1, 0)
+    knobText.BackgroundTransparency = 1
+    knobText.Text = getgenv().AutoAFK_Enabled and "ON" or "OFF"
+    knobText.TextColor3 = getgenv().AutoAFK_Enabled and Color3.fromRGB(80, 220, 120) or Color3.fromRGB(220, 80, 80)
+    knobText.Font = Enum.Font.GothamBold
+    knobText.TextSize = 9
 
-    local statsLabel = Instance.new("TextLabel")
+    -- STATS LABEL (Selalu ada)
+    local statsLabel = Instance.new("TextLabel", panel)
     statsLabel.Size = UDim2.new(1, -28, 0, 20)
-    statsLabel.Position = UDim2.fromOffset(14, 55)
+    statsLabel.Position = UDim2.new(0, 14, 0, 56)
     statsLabel.BackgroundTransparency = 1
-    statsLabel.TextColor3 = Color3.fromRGB(160, 170, 190)
+    statsLabel.Text = string.format("Sesi: %d | Runtime: %dh %dm | Est. Yen: %d", 
+        Stats.sessions, math.floor(Stats.runtime/3600), math.floor((Stats.runtime%3600)/60), Stats.yen)
+    statsLabel.TextColor3 = Color3.fromRGB(130, 150, 180)
     statsLabel.TextXAlignment = Enum.TextXAlignment.Left
-    statsLabel.Font = Enum.Font.Gotham
+    statsLabel.Font = Enum.Font.GothamMedium
     statsLabel.TextSize = 11
-    statsLabel.Text = formatStats()
-    statsLabel.Parent = panel
 
-    local statusLabel = Instance.new("TextLabel")
-    statusLabel.Size = UDim2.new(1, -28, 0, 20)
-    statusLabel.Position = UDim2.fromOffset(14, 82)
-    statusLabel.BackgroundTransparency = 1
-    statusLabel.Text = "Status: siap"
-    statusLabel.TextColor3 = Color3.fromRGB(180, 190, 205)
-    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-    statusLabel.Font = Enum.Font.GothamBold
-    statusLabel.TextSize = 12
-    statusLabel.Parent = panel
-
-    local detailLabel = Instance.new("TextLabel")
-    detailLabel.Size = UDim2.new(1, -28, 0, 16)
-    detailLabel.Position = UDim2.fromOffset(14, 103)
-    detailLabel.BackgroundTransparency = 1
-    detailLabel.Text = "OFF menghentikan seluruh aktivitas otomatis"
-    detailLabel.TextColor3 = Color3.fromRGB(135, 145, 165)
-    detailLabel.TextXAlignment = Enum.TextXAlignment.Left
-    detailLabel.Font = Enum.Font.Gotham
-    detailLabel.TextSize = 10
-    detailLabel.Parent = panel
-
-    local function applyToggleVisual()
-        local on = Runtime.enabled
-        local onColor = Color3.fromRGB(70, 190, 115)
-        local offColor = Color3.fromRGB(85, 88, 100)
-        toggle.BackgroundColor3 = on and onColor or offColor
-        knob.Position = on
-            and UDim2.new(1, -25, 0.5, -11)
-            or UDim2.new(0, 3, 0.5, -11)
-        toggleText.Text = on and "ON" or "OFF"
-        toggleText.TextColor3 = Color3.new(1, 1, 1)
-        dot.BackgroundColor3 = on and onColor or Color3.fromRGB(220, 85, 85)
-        stroke.Color = on and onColor or offColor
+    -- TIMER INFO (Hanya di AFK Room)
+    local infoLabel, subLabel
+    if opts.showTimer then
+        infoLabel = Instance.new("TextLabel", panel)
+        infoLabel.Size = UDim2.new(1, -28, 0, 20)
+        infoLabel.Position = UDim2.new(0, 14, 0, 78)
+        infoLabel.BackgroundTransparency = 1
+        infoLabel.Text = "Memantau UI Game..."
+        infoLabel.TextColor3 = Color3.fromRGB(255, 220, 80)
+        infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+        infoLabel.Font = Enum.Font.GothamBold
+        infoLabel.TextSize = 14
+        
+        subLabel = Instance.new("TextLabel", panel)
+        subLabel.Size = UDim2.new(1, -28, 0, 16)
+        subLabel.Position = UDim2.new(0, 14, 0, 100)
+        subLabel.BackgroundTransparency = 1
+        subLabel.Text = "Menunggu 'collected this session'..."
+        subLabel.TextColor3 = Color3.fromRGB(160, 160, 180)
+        subLabel.TextXAlignment = Enum.TextXAlignment.Left
+        subLabel.Font = Enum.Font.Gotham
+        subLabel.TextSize = 11
     end
 
-    Runtime.ui = {
-        destroy = function() screen:Destroy() end,
-        setStats = function(value) statsLabel.Text = value end,
-        updateStatus = function(main, detail, kind)
-            statusLabel.Text = "Status: " .. tostring(main or "")
-            detailLabel.Text = tostring(detail or "")
-            local color = Color3.fromRGB(180, 190, 205)
-            if kind == "ready" then color = Color3.fromRGB(80, 220, 120) end
-            if kind == "error" then color = Color3.fromRGB(235, 90, 90) end
-            if kind == "buffer" then color = Color3.fromRGB(255, 170, 70) end
-            statusLabel.TextColor3 = color
+    -- RETRY BUTTON
+    local retryBtn
+    if opts.showRetry then
+        retryBtn = Instance.new("TextButton", panel)
+        retryBtn.Size = UDim2.new(1, -28, 0, 30)
+        retryBtn.Position = UDim2.new(0, 14, 1, -38)
+        retryBtn.BackgroundColor3 = Color3.fromRGB(220, 80, 80)
+        retryBtn.Text = "⚠️ STUCK — KLIK UNTUK RETRY"
+        retryBtn.TextColor3 = Color3.new(1, 1, 1)
+        retryBtn.Font = Enum.Font.GothamBold
+        retryBtn.TextSize = 12
+        retryBtn.AutoButtonColor = false
+        Instance.new("UICorner", retryBtn).CornerRadius = UDim.new(0, 8)
+        retryBtn.MouseButton1Click:Connect(function()
+            if currentState.onRetry then currentState.onRetry() end
+        end)
+    end
+
+    local function applyVisuals(state)
+        local onC, offC = Color3.fromRGB(80, 220, 120), Color3.fromRGB(220, 80, 80)
+        dot.BackgroundColor3 = state and onC or offC
+        toggleBtn.BackgroundColor3 = state and onC or Color3.fromRGB(80, 80, 90)
+        knob.Position = state and UDim2.new(1, -25, 0.5, -11) or UDim2.new(0, 3, 0.5, -11)
+        knobText.Text = state and "ON" or "OFF"
+        knobText.TextColor3 = state and onC or offC
+        stroke.Color = state and onC or offC
+    end
+
+    local toggling = false
+    local function onToggle()
+        if toggling then return end
+        toggling = true
+        local newState = not getgenv().AutoAFK_Enabled
+        saveEnabled(newState)
+        applyVisuals(newState)
+        log("Toggle ->", newState and "ON" or "OFF")
+
+        if not newState and game.PlaceId == CONFIG.PLACE_AFK then
+            log("OFF di AFK Room -> Balik ke Lobby")
+            task.spawn(function()
+                task.wait(0.5)
+                teleportTo(CONFIG.PLACE_LOBBY, "balik (toggle OFF)")
+            end)
+        end
+        task.wait(0.3)
+        toggling = false
+    end
+
+    toggleBtn.MouseButton1Click:Connect(onToggle)
+    toggleBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then onToggle() end
+    end)
+
+    -- Drag
+    local dragging, dragStart, startPos
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true; dragStart = input.Position; startPos = panel.Position
+            input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then dragging = false end end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = input.Position - dragStart
+            panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+
+    local function updateStatus(mainText, subText, statusType)
+        if infoLabel then
+            infoLabel.Text = mainText
+            if subLabel then subLabel.Text = subText end
+            local color = Color3.fromRGB(255, 220, 80)
+            if statusType == "buffer" then color = Color3.fromRGB(255, 140, 60)
+            elseif statusType == "ready" then color = Color3.fromRGB(80, 220, 120) end
+            infoLabel.TextColor3 = color
             stroke.Color = color
-        end,
-        applyToggle = applyToggleVisual,
-    }
-
-    local dragging, dragInput, dragStart, startPosition
-    local began = header.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPosition = panel.Position
-            dragInput = input
-        end
-    end)
-    table.insert(Runtime.uiConnections, began)
-
-    local ended = UserInputService.InputEnded:Connect(function(input)
-        if input == dragInput then dragging = false end
-    end)
-    table.insert(Runtime.uiConnections, ended)
-
-    local changed = UserInputService.InputChanged:Connect(function(input)
-        if dragging and (
-            input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch
-        ) then
-            local delta = input.Position - dragStart
-            panel.Position = UDim2.new(
-                startPosition.X.Scale,
-                startPosition.X.Offset + delta.X,
-                startPosition.Y.Scale,
-                startPosition.Y.Offset + delta.Y
-            )
-        end
-    end)
-    table.insert(Runtime.uiConnections, changed)
-
-    local click = toggle.MouseButton1Click:Connect(function()
-        if Runtime.enabled then
-            Runtime.Disable("toggle OFF")
-        else
-            Runtime.Enable("toggle ON")
-        end
-    end)
-    table.insert(Runtime.uiConnections, click)
-
-    applyToggleVisual()
-end
-
---// Game UI detection
-local function readRewardUI()
-    local playerGui = player:FindFirstChildOfClass("PlayerGui")
-    if not playerGui then return false, "PlayerGui belum tersedia" end
-
-    local current = playerGui
-    for segment in CONFIG.UI_PATH:gmatch("[^%.]+") do
-        current = current:FindFirstChild(segment)
-        if not current then return false, "Menunggu UI reward" end
-    end
-
-    if not current:IsA("TextLabel") and not current:IsA("TextBox") then
-        return false, "Target UI bukan TextLabel/TextBox"
-    end
-
-    local value = current.Text
-    if type(value) ~= "string" then return false, "Teks UI tidak valid" end
-    return value:lower():find("collected") ~= nil, value
-end
-
---// Optional anti-idle: connected only while enabled.
-local function stopAntiIdle()
-    if Runtime.antiIdleConnection then
-        pcall(function() Runtime.antiIdleConnection:Disconnect() end)
-        Runtime.antiIdleConnection = nil
-    end
-end
-
-local function antiIdleAction()
-    if not isEnabled() then return end
-    local now = os.clock()
-    if now - Runtime.lastAntiIdle < CONFIG.ANTI_IDLE_INTERVAL then return end
-    Runtime.lastAntiIdle = now
-
-    pcall(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new(0, 0))
-    end)
-end
-
-local function startAntiIdle()
-    stopAntiIdle()
-    if not isEnabled() then return end
-
-    Runtime.lastAntiIdle = os.clock()
-    Runtime.antiIdleConnection = player.Idled:Connect(function()
-        if isEnabled() then
-            Runtime.lastAntiIdle = 0
-            antiIdleAction()
-        end
-    end)
-end
-
---// Teleport helpers
-local function queueReload()
-    if not isEnabled() or CONFIG.SCRIPT_URL == "" then return end
-    if type(queue_on_teleport) ~= "function" then return end
-
-    local source = string.format(
-        'task.wait(3); loadstring(game:HttpGet("%s"))()',
-        CONFIG.SCRIPT_URL
-    )
-    pcall(queue_on_teleport, source)
-end
-
-local function cancellableWait(seconds)
-    local started = os.clock()
-    while os.clock() - started < seconds do
-        if not isEnabled() then return false end
-        task.wait(0.2)
-    end
-    return isEnabled()
-end
-
-local function staggerWait(maxDelay, label)
-    if maxDelay <= 0 then return isEnabled() end
-    local delay = player.UserId % (maxDelay + 1)
-    if delay <= 0 then return isEnabled() end
-    log("Stagger", label, delay .. " detik")
-    return cancellableWait(delay)
-end
-
-local function teleportTo(placeId, label)
-    if not isEnabled() then return false, "disabled" end
-    log("Teleport:", label, placeId)
-
-    local methods = {
-        function() TeleportService:Teleport(placeId, player) end,
-        function()
-            TeleportService:TeleportAsync(placeId, { player })
-        end,
-    }
-
-    for methodIndex, method in ipairs(methods) do
-        for attempt, delay in ipairs(CONFIG.RETRY_DELAYS) do
-            if not isEnabled() then return false, "disabled" end
-            local ok, err = pcall(method)
-            if ok then
-                log("Teleport request diterima:", methodIndex, attempt)
-                return true
-            end
-            log("Teleport gagal:", tostring(err))
-            if not cancellableWait(delay) then
-                return false, "disabled"
-            end
-        end
-    end
-    return false, "all attempts failed"
-end
-
---// Worker lifecycle
-local function stopWorker()
-    local thread = Runtime.worker
-    Runtime.worker = nil
-    if thread then pcall(task.cancel, thread) end
-
-    local heartbeat = Runtime.heartbeatWorker
-    Runtime.heartbeatWorker = nil
-    if heartbeat then pcall(task.cancel, heartbeat) end
-
-    stopAntiIdle()
-end
-
-local function heartbeatLoop()
-    while isEnabled() do
-        writeFile(FILES.heartbeat, tostring(os.time()))
-        for _ = 1, CONFIG.HEARTBEAT_EVERY * 5 do
-            if not isEnabled() then return end
-            task.wait(0.2)
-        end
-    end
-end
-
-local function addCompletedStats(startedAt)
-    local duration = math.max(0, os.time() - startedAt)
-    Runtime.stats.sessions += 1
-    Runtime.stats.runtime += duration
-    Runtime.stats.yen += CONFIG.REWARD_YEN
-    saveStats()
-    updateStatsLabel(formatStats())
-    log("Reward tercatat. Runtime:", duration, "detik")
-end
-
-local function runLobby()
-    if not isEnabled() then return end
-    updateStatus("LOBBY", "Persiapan menuju AFK room", "ready")
-
-    local started = os.clock()
-    while os.clock() - started < CONFIG.GRACE_DELAY do
-        if not isEnabled() then return end
-        updateStatus(
-            "LOBBY",
-            string.format("Mulai dalam %ds", math.ceil(CONFIG.GRACE_DELAY - (os.clock() - started))),
-            "ready"
-        )
-        task.wait(0.2)
-    end
-
-    if not staggerWait(CONFIG.STAGGER_MAX_LOBBY, "masuk AFK") then return end
-    if not isEnabled() then return end
-
-    saveSession("lobby", os.time(), false)
-    queueReload()
-    local ok, reason = teleportTo(CONFIG.PLACE_AFK, "masuk AFK room")
-    if not ok and reason ~= "disabled" then
-        updateStatus("TELEPORT GAGAL", "Tetap di lobby. Toggle OFF/ON untuk mencoba lagi.", "error")
-    end
-end
-
-local function runAFK()
-    if not isEnabled() then return end
-
-    local session = Runtime.session or loadSession()
-    if not session or session.mode ~= "afk" then
-        session = {
-            mode = "afk",
-            startedAt = os.time(),
-            rewardClaimed = false,
-            detectedAt = nil,
-            statsCredited = false,
-        }
-        saveSession(session.mode, session.startedAt, false, nil, false)
-    end
-
-    Runtime.session = session
-    local startedAt = session.startedAt
-    local rewardClaimed = session.rewardClaimed == true
-    local detectedAt = session.detectedAt
-
-    updateStatus("AFK ROOM", "Memantau status reward", "ready")
-
-    local lastUIUpdate = 0
-
-    while isEnabled() and not rewardClaimed do
-        local collected, textValue = readRewardUI()
-        local elapsed = math.max(0, os.time() - startedAt)
-
-        if collected then
-            detectedAt = os.time()
-            rewardClaimed = true
-            saveSession("afk", startedAt, true, detectedAt, session.statsCredited)
-            log("Reward terdeteksi:", textValue)
-            break
-        end
-
-        if elapsed >= CONFIG.FALLBACK_DURATION then
-            detectedAt = os.time() - CONFIG.SAFE_BUFFER
-            rewardClaimed = true
-            saveSession("afk", startedAt, true, detectedAt, session.statsCredited)
-            log("Fallback timer tercapai; lanjut ke safe buffer.")
-            break
-        end
-
-        if os.clock() - lastUIUpdate >= CONFIG.UI_REFRESH_RATE then
-            lastUIUpdate = os.clock()
-            local remaining = math.max(0, CONFIG.FALLBACK_DURATION - elapsed)
-            updateStatus(
-                string.format("AFK %02d:%02d", math.floor(remaining / 60), remaining % 60),
-                "UI Game: " .. tostring(textValue),
-                "ready"
-            )
-        end
-        task.wait(CONFIG.POLL_RATE)
-    end
-
-    if not isEnabled() then return end
-
-    if rewardClaimed then
-        local bufferStart = detectedAt or (os.time() - CONFIG.SAFE_BUFFER)
-        while isEnabled() do
-            local remaining = CONFIG.SAFE_BUFFER - (os.time() - bufferStart)
-            if remaining <= 0 then break end
-            updateStatus(
-                string.format("BUFFER %02d:%02d", math.floor(remaining / 60), remaining % 60),
-                "Menunggu jeda keamanan reward",
-                "buffer"
-            )
-            task.wait(1)
+            dot.BackgroundColor3 = color
         end
     end
 
-    if not isEnabled() then return end
-
-    -- Mark stats only once, then clear the persisted session.
-    if rewardClaimed and Runtime.session and Runtime.session.rewardClaimed then
-        if not Runtime.session.statsCredited then
-            -- Persist the credit marker before updating totals to reduce duplicate credits
-            -- if the user toggles OFF immediately after this point.
-            saveSession("afk", startedAt, true, detectedAt, true)
-            addCompletedStats(startedAt)
-        end
-        clearSession()
-    end
-
-    updateStatus("SELESAI", "Kembali ke lobby", "ready")
-    if not cancellableWait(1) then return end
-    if not staggerWait(CONFIG.STAGGER_MAX_AFK, "keluar AFK") then return end
-
-    queueReload()
-    local ok, reason = teleportTo(CONFIG.PLACE_LOBBY, "kembali ke lobby")
-    if not ok and reason ~= "disabled" then
-        updateStatus("TELEPORT GAGAL", "Reward tersimpan. Toggle OFF/ON untuk retry.", "error")
-    end
+    currentUI = { destroy = function() sg:Destroy() end, updateStatus = updateStatus }
 end
 
-local function workerMain()
-    Runtime.heartbeatWorker = task.spawn(heartbeatLoop)
-    startAntiIdle()
-
-    while isEnabled() do
-        if game.PlaceId == CONFIG.PLACE_LOBBY then
-            runLobby()
-            -- Avoid retry loops if teleport is unavailable.
-            if isEnabled() then task.wait(3) end
-            if game.PlaceId == CONFIG.PLACE_LOBBY then
-                updateStatus("LOBBY SIAP", "Menunggu aksi berikutnya", "ready")
-                return
-            end
-        elseif game.PlaceId == CONFIG.PLACE_AFK then
-            runAFK()
-            return
-        else
-            updateStatus("PLACE TIDAK DIKENAL", tostring(game.PlaceId), "error")
-            return
-        end
-    end
-end
-
-function Runtime.Disable(reason)
-    if not Runtime.alive then return end
-    if not Runtime.enabled and not Runtime.worker then return end
-
-    -- Flip the flag first. Every worker checks this before doing work.
-    saveEnabled(false)
-    stopWorker()
-    updateStatus("OFF", "Semua aktivitas otomatis dihentikan", "error")
-    if Runtime.ui and Runtime.ui.applyToggle then
-        Runtime.ui.applyToggle()
-    end
-    log("OFF:", reason or "manual")
-end
-
-function Runtime.Enable(reason)
-    if not Runtime.alive or Runtime.enabled then return end
-
-    saveEnabled(true)
-    Runtime.session = loadSession()
-    if game.PlaceId == CONFIG.PLACE_AFK and Runtime.session and Runtime.session.mode == "lobby" then
-        saveSession("afk", os.time(), false)
-    end
-
-    if Runtime.ui and Runtime.ui.applyToggle then
-        Runtime.ui.applyToggle()
-    end
-
-    log("ON:", reason or "manual")
-    updateStatus("AKTIF", "Menjalankan worker", "ready")
-
-    stopWorker()
-    Runtime.worker = task.spawn(function()
-        local ok, err = xpcall(workerMain, debug.traceback)
-        Runtime.worker = nil
-        if not ok then
-            Runtime.lastError = tostring(err)
-            log("Worker error:", Runtime.lastError)
-            updateStatus("ERROR", Runtime.lastError, "error")
-            stopAntiIdle()
-        end
-    end)
-end
-
-function Runtime.Stop(reason)
-    if not Runtime.alive then return end
-    Runtime.alive = false
-    Runtime.enabled = false
-    genv.AutoAFK_Enabled = false
-    stopWorker()
-    destroyUI()
-    log("Runtime stopped:", reason or "cleanup")
-end
-
---// Startup
+-- =====================================================
+-- MAIN LOGIC
+-- =====================================================
+loadEnabled()
 loadStats()
-Runtime.enabled = loadEnabled()
-genv.AutoAFK_Enabled = Runtime.enabled
-Runtime.session = loadSession()
+queueReload()
 
-buildUI()
-updateStatsLabel(formatStats())
-
-if Runtime.enabled then
-    Runtime.Enable("startup")
-else
-    updateStatus("OFF", "Semua aktivitas otomatis berhenti", "error")
-    if Runtime.ui and Runtime.ui.applyToggle then
-        Runtime.ui.applyToggle()
+if game.PlaceId == CONFIG.PLACE_LOBBY then
+    log("=== LOBBY ===")
+    local sessMode = loadSession()
+    if sessMode == "afk" then clearSession() end
+    
+    if CONFIG.UI_ENABLED then buildUI({showTimer = false}) end
+    if not getgenv().AutoAFK_Enabled then return end
+    
+    log("Masuk ke AFK Room dalam " .. CONFIG.GRACE_DELAY .. "s")
+    task.wait(CONFIG.GRACE_DELAY)
+    
+    if getgenv().AutoAFK_Enabled then
+        doStaggerWait(CONFIG.STAGGER_MAX_LOBBY, "Masuk AFK") -- ⭐ FITUR STAGGER
+        saveSession("lobby", os.time())
+        teleportTo(CONFIG.PLACE_AFK, "masuk AFK")
     end
-    log("Startup dalam kondisi OFF; worker tidak dibuat.")
-end
 
--- Toggle UI visibility-independent hotkey. Only the toggle remains active while OFF.
-local keyConnection = UserInputService.InputBegan:Connect(function(input, processed)
-    if processed or not Runtime.alive then return end
-    if input.KeyCode == CONFIG.KEYBIND then
-        if Runtime.enabled then
-            Runtime.Disable("hotkey")
-        else
-            Runtime.Enable("hotkey")
+elseif game.PlaceId == CONFIG.PLACE_AFK then
+    log("=== AFK ROOM ===")
+    
+    local sessMode, sessStart = loadSession()
+    if sessMode == "lobby" then
+        saveSession("afk", os.time()); sessStart = os.time()
+    elseif not sessStart then
+        saveSession("afk", os.time()); sessStart = os.time()
+    end
+    
+    if CONFIG.UI_ENABLED then buildUI({showTimer = true}) end
+    if not getgenv().AutoAFK_Enabled then return end
+
+    log("Fase 1: Menunggu UI Game berubah 'collected'...")
+    local detectedCollected = false
+    local detectionTime = 0
+    
+    -- ================= FASE 1: DETEKSI =================
+    while getgenv().AutoAFK_Enabled do
+        task.wait(CONFIG.POLL_RATE)
+        
+        local isCollected, currentText = isRewardCollected()
+        if isCollected then
+            log("✅ Teks UI berubah: " .. currentText)
+            detectedCollected = true
+            detectionTime = os.time()
+            break
+        end
+        
+        local elapsed = os.time() - sessStart
+        if elapsed >= CONFIG.FALLBACK_DURATION then
+            log("⚠️ Fallback timer (UI macet). Force exit.")
+            detectedCollected = true
+            detectionTime = os.time() - CONFIG.SAFE_BUFFER 
+            break
+        end
+        
+        if currentUI and (elapsed % 2 == 0) then
+            local sisa = math.max(0, 1800 - elapsed)
+            currentUI.updateStatus(string.format("Sisa %02d:%02d", math.floor(sisa/60), sisa%60), "UI Game: " .. (currentText or "?"), "normal")
         end
     end
-end)
-table.insert(Runtime.uiConnections, keyConnection)
-
-log("v22 initialized. Enabled =", Runtime.enabled)
+    
+    -- ================= FASE 2: BUFFER =================
+    if detectedCollected and getgenv().AutoAFK_Enabled then
+        log(string.format("Fase 2: Safe Buffer %ds...", CONFIG.SAFE_BUFFER))
+        while getgenv().AutoAFK_Enabled do
+            task.wait(CONFIG.POLL_RATE)
+            local bufferElapsed = os.time() - detectionTime
+            local bufferRemaining = CONFIG.SAFE_BUFFER - bufferElapsed
+            if bufferRemaining <= 0 then break end
+            
+            if currentUI then
+                currentUI.updateStatus(string.format("Buffer: %02d:%02d", math.floor(bufferRemaining/60), bufferRemaining%60), "Reward aman. Menunggu jeda...", "buffer")
+            end
+        end
+    end
+    
+    -- ================= FASE 3: EXIT =================
+    if getgenv().AutoAFK_Enabled then
+        if currentUI then currentUI.updateStatus("✅ KELUAR", "Pindah ke Lobby...", "ready") end
+        
+        -- Update Stats (Hitung berapa lama sesi ini berjalan)
+        local totalSessionTime = os.time() - sessStart
+        addStatsSession(400) -- Tambah 1 sesi, +400 Yen
+        addStatsRuntime(totalSessionTime) -- Tambah runtime
+        
+        task.wait(1)
+        clearSession()
+        queueReload()
+        
+        doStaggerWait(CONFIG.STAGGER_MAX_AFK, "Keluar AFK") -- ⭐ FITUR STAGGER
+        
+        local success = teleportTo(CONFIG.PLACE_LOBBY, "balik ke Lobby")
+        if not success then
+            log("❌ Gagal balik ke Lobby.")
+            if CONFIG.UI_ENABLED then
+                buildUI({ showTimer = false, showRetry = true })
+                currentState.onRetry = function()
+                    if teleportTo(CONFIG.PLACE_LOBBY, "manual retry") then clearSession() end
+                end
+            end
+        end
+    end
+else
+    log("PlaceId tidak dikenal.")
+end
