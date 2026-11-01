@@ -1,3 +1,707 @@
+--[[
+    AUTO AFK - RACKET RIVALS v22
+    Lifecycle rebuild: strict OFF, single worker, cleanup, persistent state.
+
+    Catatan:
+    - Memerlukan executor yang mendukung getgenv().
+    - File API (readfile/writefile/isfile) dan queue_on_teleport bersifat opsional.
+    - Tidak menonaktifkan koneksi Idled milik script/game lain.
+    - Uji di environment pribadi terlebih dahulu. Tidak ada jaminan kompatibilitas
+      terhadap perubahan game atau executor di masa mendatang.
+]]
+
+local CONFIG = {
+    PLACE_LOBBY = 90906407195271,
+    PLACE_AFK = 82492382424045,
+
+    UI_PATH = "PAGES.AfkLobbyPage.Content.Body.Earnings.TimerCard.GuaranteeStrip.Body.Note",
+
+    SAFE_BUFFER = 120,
+    FALLBACK_DURATION = 34 * 60,
+    GRACE_DELAY = 5,
+    STAGGER_MAX_LOBBY = 25,
+    STAGGER_MAX_AFK = 10,
+
+    POLL_RATE = 1,
+    UI_REFRESH_RATE = 1,
+    HEARTBEAT_EVERY = 10,
+    ANTI_IDLE_INTERVAL = 55,
+
+    RETRY_DELAYS = {3, 10, 30},
+    REWARD_YEN = 400,
+
+    KEYBIND = Enum.KeyCode.RightShift,
+    UI_ENABLED = true,
+    DEBUG = true,
+
+    SCRIPT_URL = "https://raw.githubusercontent.com/rivaldirasyid/afk-racket-rivals/refs/heads/main/init",
+
+    FILE_PREFIX = "AutoAFK_RR_v22",
+}
+
+--// Services
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+
+local player = Players.LocalPlayer
+local genv = getgenv and getgenv() or _G
+local suffix = "_" .. tostring(player.UserId)
+
+local FILES = {
+    enabled = CONFIG.FILE_PREFIX .. "_enabled" .. suffix .. ".txt",
+    session = CONFIG.FILE_PREFIX .. "_session" .. suffix .. ".txt",
+    stats = CONFIG.FILE_PREFIX .. "_stats" .. suffix .. ".txt",
+    heartbeat = CONFIG.FILE_PREFIX .. "_heartbeat" .. suffix .. ".txt",
+    log = CONFIG.FILE_PREFIX .. "_log" .. suffix .. ".txt",
+}
+
+local fileAvailable =
+    type(writefile) == "function"
+    and type(readfile) == "function"
+    and type(isfile) == "function"
+
+local function safeCall(fn, ...)
+    if type(fn) ~= "function" then
+        return false, "function unavailable"
+    end
+    return pcall(fn, ...)
+end
+
+local function writeFile(path, content)
+    if not fileAvailable then return false end
+    local ok = pcall(writefile, path, tostring(content))
+    return ok
+end
+
+local function readFile(path)
+    if not fileAvailable then return nil end
+    local ok, exists = pcall(isfile, path)
+    if not ok or not exists then return nil end
+    local readOk, result = pcall(readfile, path)
+    if readOk then return result end
+    return nil
+end
+
+--// Stop a previous copy cleanly before creating this runtime.
+local previous = genv.AutoAFK_V22_Runtime
+if type(previous) == "table" and type(previous.Stop) == "function" then
+    pcall(previous.Stop, "replaced by a new script instance")
+end
+
+local Runtime = {
+    alive = true,
+    enabled = false,
+    worker = nil,
+    heartbeatWorker = nil,
+    antiIdleConnection = nil,
+    uiConnections = {},
+    ui = nil,
+    lastAntiIdle = 0,
+    lastHeartbeat = 0,
+    session = nil,
+    stats = { sessions = 0, runtime = 0, yen = 0 },
+    lastError = nil,
+}
+genv.AutoAFK_V22_Runtime = Runtime
+
+local function log(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        parts[#parts + 1] = tostring(select(i, ...))
+    end
+    local message = table.concat(parts, " ")
+    if CONFIG.DEBUG then
+        print("[AutoAFK v22] " .. message)
+    end
+
+    local line = os.date("[%Y-%m-%d %H:%M:%S] ") .. message .. "\n"
+    if fileAvailable then
+        local old = readFile(FILES.log) or ""
+        if #old > 100000 then old = "[log rotated]\n" end
+        writeFile(FILES.log, old .. line)
+    end
+end
+
+local function loadEnabled()
+    local value = readFile(FILES.enabled)
+    if value then
+        value = value:lower():gsub("%s+", "")
+        return value == "on" or value == "true" or value == "1"
+    end
+    return true
+end
+
+local function saveEnabled(value)
+    Runtime.enabled = value == true
+    genv.AutoAFK_Enabled = Runtime.enabled
+    writeFile(FILES.enabled, Runtime.enabled and "on" or "off")
+end
+
+local function loadStats()
+    local raw = readFile(FILES.stats)
+    if not raw then return end
+    local sessions, runtime, yen = raw:match("^(%d+)|(%d+)|(%d+)$")
+    if sessions then
+        Runtime.stats.sessions = tonumber(sessions) or 0
+        Runtime.stats.runtime = tonumber(runtime) or 0
+        Runtime.stats.yen = tonumber(yen) or 0
+    end
+end
+
+local function saveStats()
+    local s = Runtime.stats
+    writeFile(FILES.stats, string.format("%d|%d|%d", s.sessions, s.runtime, s.yen))
+end
+
+local function saveSession(mode, startedAt, rewardClaimed, detectedAt, statsCredited)
+    Runtime.session = {
+        mode = mode,
+        startedAt = startedAt or os.time(),
+        rewardClaimed = rewardClaimed == true,
+        detectedAt = detectedAt,
+        statsCredited = statsCredited == true,
+    }
+    writeFile(FILES.session, string.format(
+        "%s|%d|%d|%d|%d",
+        Runtime.session.mode,
+        Runtime.session.startedAt,
+        Runtime.session.rewardClaimed and 1 or 0,
+        Runtime.session.detectedAt or 0,
+        Runtime.session.statsCredited and 1 or 0
+    ))
+end
+
+local function loadSession()
+    local raw = readFile(FILES.session)
+    if not raw then return nil end
+    local mode, startedAt, claimed, detectedAt, credited =
+        raw:match("^([^|]+)|(%d+)|(%d+)|(%d+)|(%d+)$")
+    if not mode or not startedAt then
+        -- Backward compatibility with v21/v22 early session format.
+        mode, startedAt, claimed = raw:match("^([^|]+)|(%d+)|(%d+)$")
+        if not mode or not startedAt then return nil end
+        detectedAt, credited = "0", "0"
+    end
+    return {
+        mode = mode,
+        startedAt = tonumber(startedAt),
+        rewardClaimed = claimed == "1",
+        detectedAt = tonumber(detectedAt) > 0 and tonumber(detectedAt) or nil,
+        statsCredited = credited == "1",
+    }
+end
+
+local function clearSession()
+    Runtime.session = nil
+    writeFile(FILES.session, "")
+end
+
+local function isEnabled()
+    return Runtime.alive and Runtime.enabled
+end
+
+local function updateStatus(mainText, subText, status)
+    if not Runtime.ui then return end
+    pcall(function()
+        Runtime.ui.updateStatus(mainText, subText, status)
+    end)
+end
+
+local function updateStatsLabel(message)
+    if not Runtime.ui then return end
+    pcall(function()
+        Runtime.ui.setStats(message)
+    end)
+end
+
+local function formatStats()
+    local s = Runtime.stats
+    return string.format(
+        "Sesi: %d | Runtime: %dh %dm | Est. Yen: %d",
+        s.sessions,
+        math.floor(s.runtime / 3600),
+        math.floor((s.runtime % 3600) / 60),
+        s.yen
+    )
+end
+
+--// UI
+local function disconnectUIConnections()
+    for _, connection in ipairs(Runtime.uiConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(Runtime.uiConnections)
+end
+
+local function destroyUI()
+    disconnectUIConnections()
+    if Runtime.ui then
+        pcall(function() Runtime.ui.destroy() end)
+        Runtime.ui = nil
+    end
+
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        local old = pg:FindFirstChild("AutoAFK_UI")
+        if old then old:Destroy() end
+    end
+
+    if type(gethui) == "function" then
+        pcall(function()
+            local hui = gethui()
+            local old = hui and hui:FindFirstChild("AutoAFK_UI")
+            if old then old:Destroy() end
+        end)
+    end
+end
+
+local function buildUI()
+    if not CONFIG.UI_ENABLED then return end
+    destroyUI()
+
+    local parent
+    if type(gethui) == "function" then
+        local ok, hui = pcall(gethui)
+        if ok and hui then parent = hui end
+    end
+    parent = parent or player:WaitForChild("PlayerGui")
+
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "AutoAFK_UI"
+    screen.ResetOnSpawn = false
+    screen.DisplayOrder = 10000
+    screen.IgnoreGuiInset = true
+    screen.Parent = parent
+
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.Size = UDim2.fromOffset(330, 126)
+    panel.Position = UDim2.new(1, -350, 0, 24)
+    panel.BackgroundColor3 = Color3.fromRGB(20, 22, 29)
+    panel.BackgroundTransparency = 0.05
+    panel.BorderSizePixel = 0
+    panel.Parent = screen
+    Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 12)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1.5
+    stroke.Color = Color3.fromRGB(80, 220, 120)
+    stroke.Parent = panel
+
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, 48)
+    header.BackgroundTransparency = 1
+    header.Active = true
+    header.Parent = panel
+
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.fromOffset(9, 9)
+    dot.Position = UDim2.fromOffset(15, 19)
+    dot.BorderSizePixel = 0
+    dot.BackgroundColor3 = Color3.fromRGB(80, 220, 120)
+    dot.Parent = header
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -120, 1, 0)
+    title.Position = UDim2.fromOffset(31, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "AUTO AFK  |  v22"
+    title.TextColor3 = Color3.fromRGB(245, 245, 250)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 13
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = header
+
+    local toggle = Instance.new("TextButton")
+    toggle.Name = "Toggle"
+    toggle.Size = UDim2.fromOffset(76, 28)
+    toggle.Position = UDim2.new(1, -88, 0.5, -14)
+    toggle.AutoButtonColor = false
+    toggle.BorderSizePixel = 0
+    toggle.Text = ""
+    toggle.Parent = header
+    Instance.new("UICorner", toggle).CornerRadius = UDim.new(1, 0)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(22, 22)
+    knob.BorderSizePixel = 0
+    knob.BackgroundColor3 = Color3.new(1, 1, 1)
+    knob.Parent = toggle
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local toggleText = Instance.new("TextLabel")
+    toggleText.Size = UDim2.new(1, 0, 1, 0)
+    toggleText.BackgroundTransparency = 1
+    toggleText.Font = Enum.Font.GothamBold
+    toggleText.TextSize = 9
+    toggleText.Parent = toggle
+
+    local statsLabel = Instance.new("TextLabel")
+    statsLabel.Size = UDim2.new(1, -28, 0, 20)
+    statsLabel.Position = UDim2.fromOffset(14, 55)
+    statsLabel.BackgroundTransparency = 1
+    statsLabel.TextColor3 = Color3.fromRGB(160, 170, 190)
+    statsLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statsLabel.Font = Enum.Font.Gotham
+    statsLabel.TextSize = 11
+    statsLabel.Text = formatStats()
+    statsLabel.Parent = panel
+
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, -28, 0, 20)
+    statusLabel.Position = UDim2.fromOffset(14, 82)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Text = "Status: siap"
+    statusLabel.TextColor3 = Color3.fromRGB(180, 190, 205)
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.Font = Enum.Font.GothamBold
+    statusLabel.TextSize = 12
+    statusLabel.Parent = panel
+
+    local detailLabel = Instance.new("TextLabel")
+    detailLabel.Size = UDim2.new(1, -28, 0, 16)
+    detailLabel.Position = UDim2.fromOffset(14, 103)
+    detailLabel.BackgroundTransparency = 1
+    detailLabel.Text = "OFF menghentikan seluruh aktivitas otomatis"
+    detailLabel.TextColor3 = Color3.fromRGB(135, 145, 165)
+    detailLabel.TextXAlignment = Enum.TextXAlignment.Left
+    detailLabel.Font = Enum.Font.Gotham
+    detailLabel.TextSize = 10
+    detailLabel.Parent = panel
+
+    local function applyToggleVisual()
+        local on = Runtime.enabled
+        local onColor = Color3.fromRGB(70, 190, 115)
+        local offColor = Color3.fromRGB(85, 88, 100)
+        toggle.BackgroundColor3 = on and onColor or offColor
+        knob.Position = on
+            and UDim2.new(1, -25, 0.5, -11)
+            or UDim2.new(0, 3, 0.5, -11)
+        toggleText.Text = on and "ON" or "OFF"
+        toggleText.TextColor3 = Color3.new(1, 1, 1)
+        dot.BackgroundColor3 = on and onColor or Color3.fromRGB(220, 85, 85)
+        stroke.Color = on and onColor or offColor
+    end
+
+    Runtime.ui = {
+        destroy = function() screen:Destroy() end,
+        setStats = function(value) statsLabel.Text = value end,
+        updateStatus = function(main, detail, kind)
+            statusLabel.Text = "Status: " .. tostring(main or "")
+            detailLabel.Text = tostring(detail or "")
+            local color = Color3.fromRGB(180, 190, 205)
+            if kind == "ready" then color = Color3.fromRGB(80, 220, 120) end
+            if kind == "error" then color = Color3.fromRGB(235, 90, 90) end
+            if kind == "buffer" then color = Color3.fromRGB(255, 170, 70) end
+            statusLabel.TextColor3 = color
+            stroke.Color = color
+        end,
+        applyToggle = applyToggleVisual,
+    }
+
+    local dragging, dragInput, dragStart, startPosition
+    local began = header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPosition = panel.Position
+            dragInput = input
+        end
+    end)
+    table.insert(Runtime.uiConnections, began)
+
+    local ended = UserInputService.InputEnded:Connect(function(input)
+        if input == dragInput then dragging = false end
+    end)
+    table.insert(Runtime.uiConnections, ended)
+
+    local changed = UserInputService.InputChanged:Connect(function(input)
+        if dragging and (
+            input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch
+        ) then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(
+                startPosition.X.Scale,
+                startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale,
+                startPosition.Y.Offset + delta.Y
+            )
+        end
+    end)
+    table.insert(Runtime.uiConnections, changed)
+
+    local click = toggle.MouseButton1Click:Connect(function()
+        if Runtime.enabled then
+            Runtime.Disable("toggle OFF")
+        else
+            Runtime.Enable("toggle ON")
+        end
+    end)
+    table.insert(Runtime.uiConnections, click)
+
+    applyToggleVisual()
+end
+
+--// Game UI detection
+local function readRewardUI()
+    local playerGui = player:FindFirstChildOfClass("PlayerGui")
+    if not playerGui then return false, "PlayerGui belum tersedia" end
+
+    local current = playerGui
+    for segment in CONFIG.UI_PATH:gmatch("[^%.]+") do
+        current = current:FindFirstChild(segment)
+        if not current then return false, "Menunggu UI reward" end
+    end
+
+    if not current:IsA("TextLabel") and not current:IsA("TextBox") then
+        return false, "Target UI bukan TextLabel/TextBox"
+    end
+
+    local value = current.Text
+    if type(value) ~= "string" then return false, "Teks UI tidak valid" end
+    return value:lower():find("collected") ~= nil, value
+end
+
+--// Optional anti-idle: connected only while enabled.
+local function stopAntiIdle()
+    if Runtime.antiIdleConnection then
+        pcall(function() Runtime.antiIdleConnection:Disconnect() end)
+        Runtime.antiIdleConnection = nil
+    end
+end
+
+local function antiIdleAction()
+    if not isEnabled() then return end
+    local now = os.clock()
+    if now - Runtime.lastAntiIdle < CONFIG.ANTI_IDLE_INTERVAL then return end
+    Runtime.lastAntiIdle = now
+
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new(0, 0))
+    end)
+end
+
+local function startAntiIdle()
+    stopAntiIdle()
+    if not isEnabled() then return end
+
+    Runtime.lastAntiIdle = os.clock()
+    Runtime.antiIdleConnection = player.Idled:Connect(function()
+        if isEnabled() then
+            Runtime.lastAntiIdle = 0
+            antiIdleAction()
+        end
+    end)
+end
+
+--// Teleport helpers
+local function queueReload()
+    if not isEnabled() or CONFIG.SCRIPT_URL == "" then return end
+    if type(queue_on_teleport) ~= "function" then return end
+
+    local source = string.format(
+        'task.wait(3); loadstring(game:HttpGet("%s"))()',
+        CONFIG.SCRIPT_URL
+    )
+    pcall(queue_on_teleport, source)
+end
+
+local function cancellableWait(seconds)
+    local started = os.clock()
+    while os.clock() - started < seconds do
+        if not isEnabled() then return false end
+        task.wait(0.2)
+    end
+    return isEnabled()
+end
+
+local function staggerWait(maxDelay, label)
+    if maxDelay <= 0 then return isEnabled() end
+    local delay = player.UserId % (maxDelay + 1)
+    if delay <= 0 then return isEnabled() end
+    log("Stagger", label, delay .. " detik")
+    return cancellableWait(delay)
+end
+
+local function teleportTo(placeId, label)
+    if not isEnabled() then return false, "disabled" end
+    log("Teleport:", label, placeId)
+
+    local methods = {
+        function() TeleportService:Teleport(placeId, player) end,
+        function()
+            TeleportService:TeleportAsync(placeId, { player })
+        end,
+    }
+
+    for methodIndex, method in ipairs(methods) do
+        for attempt, delay in ipairs(CONFIG.RETRY_DELAYS) do
+            if not isEnabled() then return false, "disabled" end
+            local ok, err = pcall(method)
+            if ok then
+                log("Teleport request diterima:", methodIndex, attempt)
+                return true
+            end
+            log("Teleport gagal:", tostring(err))
+            if not cancellableWait(delay) then
+                return false, "disabled"
+            end
+        end
+    end
+    return false, "all attempts failed"
+end
+
+--// Worker lifecycle
+local function stopWorker()
+    local thread = Runtime.worker
+    Runtime.worker = nil
+    if thread then pcall(task.cancel, thread) end
+
+    local heartbeat = Runtime.heartbeatWorker
+    Runtime.heartbeatWorker = nil
+    if heartbeat then pcall(task.cancel, heartbeat) end
+
+    stopAntiIdle()
+end
+
+local function heartbeatLoop()
+    while isEnabled() do
+        writeFile(FILES.heartbeat, tostring(os.time()))
+        for _ = 1, CONFIG.HEARTBEAT_EVERY * 5 do
+            if not isEnabled() then return end
+            task.wait(0.2)
+        end
+    end
+end
+
+local function addCompletedStats(startedAt)
+    local duration = math.max(0, os.time() - startedAt)
+    Runtime.stats.sessions += 1
+    Runtime.stats.runtime += duration
+    Runtime.stats.yen += CONFIG.REWARD_YEN
+    saveStats()
+    updateStatsLabel(formatStats())
+    log("Reward tercatat. Runtime:", duration, "detik")
+end
+
+local function runLobby()
+    if not isEnabled() then return end
+    updateStatus("LOBBY", "Persiapan menuju AFK room", "ready")
+
+    local started = os.clock()
+    while os.clock() - started < CONFIG.GRACE_DELAY do
+        if not isEnabled() then return end
+        updateStatus(
+            "LOBBY",
+            string.format("Mulai dalam %ds", math.ceil(CONFIG.GRACE_DELAY - (os.clock() - started))),
+            "ready"
+        )
+        task.wait(0.2)
+    end
+
+    if not staggerWait(CONFIG.STAGGER_MAX_LOBBY, "masuk AFK") then return end
+    if not isEnabled() then return end
+
+    saveSession("lobby", os.time(), false)
+    queueReload()
+    local ok, reason = teleportTo(CONFIG.PLACE_AFK, "masuk AFK room")
+    if not ok and reason ~= "disabled" then
+        updateStatus("TELEPORT GAGAL", "Tetap di lobby. Toggle OFF/ON untuk mencoba lagi.", "error")
+    end
+end
+
+local function runAFK()
+    if not isEnabled() then return end
+
+    local session = Runtime.session or loadSession()
+    if not session or session.mode ~= "afk" then
+        session = {
+            mode = "afk",
+            startedAt = os.time(),
+            rewardClaimed = false,
+            detectedAt = nil,
+            statsCredited = false,
+        }
+        saveSession(session.mode, session.startedAt, false, nil, false)
+    end
+
+    Runtime.session = session
+    local startedAt = session.startedAt
+    local rewardClaimed = session.rewardClaimed == true
+    local detectedAt = session.detectedAt
+
+    updateStatus("AFK ROOM", "Memantau status reward", "ready")
+
+    local lastUIUpdate = 0
+
+    while isEnabled() and not rewardClaimed do
+        local collected, textValue = readRewardUI()
+        local elapsed = math.max(0, os.time() - startedAt)
+
+        if collected then
+            detectedAt = os.time()
+            rewardClaimed = true
+            saveSession("afk", startedAt, true, detectedAt, session.statsCredited)
+            log("Reward terdeteksi:", textValue)
+            break
+        end
+
+        if elapsed >= CONFIG.FALLBACK_DURATION then
+            detectedAt = os.time() - CONFIG.SAFE_BUFFER
+            rewardClaimed = true
+            saveSession("afk", startedAt, true, detectedAt, session.statsCredited)
+            log("Fallback timer tercapai; lanjut ke safe buffer.")
+            break
+        end
+
+        if os.clock() - lastUIUpdate >= CONFIG.UI_REFRESH_RATE then
+            lastUIUpdate = os.clock()
+            local remaining = math.max(0, CONFIG.FALLBACK_DURATION - elapsed)
+            updateStatus(
+                string.format("AFK %02d:%02d", math.floor(remaining / 60), remaining % 60),
+                "UI Game: " .. tostring(textValue),
+                "ready"
+            )
+        end
+        task.wait(CONFIG.POLL_RATE)
+    end
+
+    if not isEnabled() then return end
+
+    if rewardClaimed then
+        local bufferStart = detectedAt or (os.time() - CONFIG.SAFE_BUFFER)
+        while isEnabled() do
+            local remaining = CONFIG.SAFE_BUFFER - (os.time() - bufferStart)
+            if remaining <= 0 then break end
+            updateStatus(
+                string.format("BUFFER %02d:%02d", math.floor(remaining / 60), remaining % 60),
+                "Menunggu jeda keamanan reward",
+                "buffer"
+            )
+            task.wait(1)
+        end
+    end
+
+    if not isEnabled() then return end
+
+    -- Mark stats only once, then clear the persisted session.
+    if rewardClaimed and Runtime.session and Runtime.session.rewardClaimed then
+        if not Runtime.session.statsCredited then
+            -- Persist the credit marker before updating totals to reduce duplicate credits
+            -- if the user toggles OFF immediately after this point.
+            saveSession("afk", startedAt, true, detectedAt, true)
+            addCompletedStats(startedAt)
+        end
+        clearSession()
+    end
+
+    updateStatus("SELESAI", "Kembali ke lobby", "ready")
     if not cancellableWait(1) then return end
     if not staggerWait(CONFIG.STAGGER_MAX_AFK, "keluar AFK") then return end
 
